@@ -1,0 +1,21 @@
+# //// Neoffice — added file (no upstream equivalent): the egui panel of the Nora client core.
+[package]
+name = "craft-nora-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "egui panel to talk to Nora inside a Craft editor, on top of craft-nora"
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-nora = { workspace = true }
+egui = { workspace = true }
+
+[dev-dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+egui_kittest = "0.36"
+serde_json = "1"

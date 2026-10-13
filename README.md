@@ -27,6 +27,9 @@ craft-<name> = { git = "https://github.com/storytold/craft-libs", rev = "<commit
 - [`craft-cms`](crates/cms/README.md): pure-Rust ICC v2/v4 colour management: profile parsing
   and writing, transforms, rendering intents, black point compensation, soft proofing, gamut
   checks, 3D LUTs and built-in profiles (sRGB, Display P3, synthetic coated CMYK and others).
+<!-- //// Neoffice — added crates: the Nora client core and its egui panel, shared by every Neoffice editor (decision of 2026-10-13). -->
+- [`craft-nora`](crates/nora/README.md): sans-I/O client core for Nora, the Neoffice assistant: wire protocol, conversation state machine and the actions Nora asks for in the open document. Nora itself stays on the server.
+- [`craft-nora-ui`](crates/nora-ui/README.md): egui chat panel for Nora and the frame-loop glue that drives a `craft-nora` session; words and colors come from the app.
 - [`craft-print`](crates/print/README.md): PDF submission to CUPS and Windows, printer discovery,
   duplex/copies/colour and driver preferences. PDF generation stays in each app.
 

@@ -1,0 +1,16 @@
+# //// Neoffice — added file (no upstream equivalent): the Nora client core shared by the Neoffice editors.
+[package]
+name = "craft-nora"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Sans-I/O client core for Nora, the Neoffice assistant: protocol, conversation state machine and document actions"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

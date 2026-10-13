@@ -13,6 +13,9 @@ repository = "https://github.com/storytold/craft-libs"
 # internal: add each crate here as `craft-<name> = { path = "crates/<name>" }`
 craft-atomic = { path = "crates/atomic" }
 craft-cms = { path = "crates/cms" }
+# //// Neoffice — added crates: the Nora client core and its egui panel, shared by every Neoffice editor (decision of 2026-10-13).
+craft-nora = { path = "crates/nora" }
+craft-nora-ui = { path = "crates/nora-ui" }
 craft-print = { path = "crates/print" }
 craft-quit = { path = "crates/quit" }
 craft-settings = { path = "crates/settings" }

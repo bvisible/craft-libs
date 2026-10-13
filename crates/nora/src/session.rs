@@ -1,0 +1,416 @@
+// //// Neoffice — added file (no upstream equivalent): the conversation state machine of the Nora client core.
+
+use std::collections::HashMap;
+
+use serde_json::Value;
+
+use crate::context::PageContext;
+use crate::error::NoraError;
+use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
+use crate::policy::{CommandPolicy, Decision};
+use crate::protocol::{
+    self, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, observation_body, observation_error, observation_ok, parse_actions,
+    parse_messages, post_message_body, start_thread_body, thread_body, thread_id_of,
+};
+
+/// How a session behaves. The defaults suit an editor talking to a Neoffice instance.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// What Nora may play in the document.
+    pub policy: CommandPolicy,
+    /// Time between two reads of the replies and of the action queue while Nora works.
+    pub poll_interval_ms: u64,
+    /// How long without a reply or an action before Nora is considered done.
+    pub idle_after_ms: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig { policy: CommandPolicy::default(), poll_interval_ms: 1_500, idle_after_ms: 10_000 }
+    }
+}
+
+/// What the host and the user feed into a session.
+#[derive(Debug, Clone)]
+pub enum Input {
+    /// The user sent a message.
+    Send(String),
+    /// The open document changed (another selection, another page count…).
+    SetContext(PageContext),
+    /// Time passed. The host sends one regularly (every frame is fine); it is the session's only
+    /// clock.
+    Tick { now_ms: u64 },
+    /// The answer to an [`Output::Http`].
+    Http(HttpResponse),
+    /// The result of an [`Output::Document`] the editor ran.
+    DocumentResult { id: u64, result: Result<Value, String> },
+    /// The user clicked yes or no on a [`Confirmation`].
+    Confirm { id: u64, accepted: bool },
+    /// The user clicked Undo.
+    UndoLast,
+    /// The user started a new conversation.
+    Reset,
+}
+
+/// What a session asks of the host.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Output {
+    /// Make this call and feed the answer back as [`Input::Http`].
+    Http(HttpRequest),
+    /// Run this in the open document and feed the result back as [`Input::DocumentResult`].
+    Document(DocumentCall),
+    /// The transcript, the busy state, the error or the confirmations changed: repaint.
+    Changed,
+}
+
+/// An action for the editor to run through its own control channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentCall {
+    pub id: u64,
+    pub kind: DocActionKind,
+}
+
+/// An action waiting for the user's yes or no.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Confirmation {
+    pub id: u64,
+    /// An English sentence for the panel. A host that shows another language describes `kind` itself.
+    pub summary: String,
+    /// What Nora asked for.
+    pub kind: DocActionKind,
+}
+
+enum Pending {
+    Send,
+    Messages,
+    Actions,
+    Observation,
+}
+
+struct Running {
+    callback_id: Option<String>,
+    modifies: bool,
+    summary: String,
+}
+
+struct Waiting {
+    id: u64,
+    action: DocAction,
+}
+
+/// One conversation between a user and Nora, inside one open document.
+pub struct NoraSession {
+    cfg: SessionConfig,
+    context: PageContext,
+    thread_id: Option<String>,
+    transcript: Vec<ChatMessage>,
+    known_replies: usize,
+    busy: bool,
+    last_error: Option<String>,
+    now_ms: u64,
+    last_activity_ms: u64,
+    next_poll_ms: Option<u64>,
+    next_id: u64,
+    inflight: HashMap<RequestId, Pending>,
+    running: HashMap<u64, Running>,
+    waiting: Vec<Waiting>,
+    changes: Vec<String>,
+}
+
+impl NoraSession {
+    pub fn new(cfg: SessionConfig, context: PageContext) -> Self {
+        NoraSession {
+            cfg,
+            context,
+            thread_id: None,
+            transcript: Vec::new(),
+            known_replies: 0,
+            busy: false,
+            last_error: None,
+            now_ms: 0,
+            last_activity_ms: 0,
+            next_poll_ms: None,
+            next_id: 0,
+            inflight: HashMap::new(),
+            running: HashMap::new(),
+            waiting: Vec::new(),
+            changes: Vec::new(),
+        }
+    }
+
+    /// Feeds one input and returns what the host has to do about it.
+    pub fn handle(&mut self, input: Input) -> Vec<Output> {
+        let mut out = Vec::new();
+        match input {
+            Input::Send(text) => self.on_send(text, &mut out),
+            Input::SetContext(context) => self.context = context,
+            Input::Tick { now_ms } => self.on_tick(now_ms, &mut out),
+            Input::Http(response) => self.on_http(response, &mut out),
+            Input::DocumentResult { id, result } => self.on_document_result(id, result, &mut out),
+            Input::Confirm { id, accepted } => self.on_confirm(id, accepted, &mut out),
+            Input::UndoLast => self.on_undo(&mut out),
+            Input::Reset => self.on_reset(&mut out),
+        }
+        out
+    }
+
+    /// The conversation so far, oldest first.
+    pub fn transcript(&self) -> &[ChatMessage] {
+        &self.transcript
+    }
+
+    /// Whether Nora is working on the last message.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// The last failure, to show in the panel. A successful read clears it.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// The conversation id, once Nora has given one.
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
+    /// The actions waiting for the user's yes or no.
+    pub fn confirmations(&self) -> Vec<Confirmation> {
+        self.waiting.iter().map(|w| Confirmation { id: w.id, summary: w.action.kind.summary(), kind: w.action.kind.clone() }).collect()
+    }
+
+    /// Whether a change Nora made can be undone.
+    pub fn can_undo(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// The time at which the host should send the next [`Input::Tick`], when the session is
+    /// waiting for something; `None` when it is idle and needs nothing.
+    pub fn next_wake_ms(&self) -> Option<u64> {
+        if self.busy { Some(self.next_poll_ms.unwrap_or(self.now_ms).max(self.now_ms)) } else { None }
+    }
+
+    fn new_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn request(&mut self, path: &str, body: Value, kind: Pending) -> Output {
+        let id = self.new_id();
+        self.inflight.insert(id, kind);
+        Output::Http(HttpRequest { id, path: path.to_string(), body })
+    }
+
+    fn polling(&self) -> bool {
+        self.inflight.values().any(|pending| matches!(pending, Pending::Messages | Pending::Actions))
+    }
+
+    fn on_send(&mut self, text: String, out: &mut Vec<Output>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.transcript.push(ChatMessage::user(text.clone()));
+        self.busy = true;
+        self.last_error = None;
+        self.last_activity_ms = self.now_ms;
+        let request = match self.thread_id.clone() {
+            Some(thread) => self.request(protocol::POST_MESSAGE, post_message_body(&thread, &text, &self.context), Pending::Send),
+            None => self.request(protocol::START_OR_RESUME_THREAD, start_thread_body(&text, &self.context), Pending::Send),
+        };
+        out.push(request);
+        out.push(Output::Changed);
+    }
+
+    fn on_tick(&mut self, now_ms: u64, out: &mut Vec<Output>) {
+        self.now_ms = now_ms;
+        if !self.busy {
+            return;
+        }
+        // Done first: a quiet turn with nothing pending ends without one more poll.
+        let quiet = now_ms.saturating_sub(self.last_activity_ms) >= self.cfg.idle_after_ms;
+        let nothing_pending =
+            self.inflight.values().all(|pending| matches!(pending, Pending::Observation)) && self.running.is_empty() && self.waiting.is_empty();
+        if quiet && nothing_pending {
+            self.busy = false;
+            self.next_poll_ms = None;
+            out.push(Output::Changed);
+            return;
+        }
+        if let Some(thread) = self.thread_id.clone()
+            && self.next_poll_ms.is_some_and(|due| now_ms >= due)
+            && !self.polling()
+        {
+            let messages = self.request(protocol::GET_MESSAGES, thread_body(&thread), Pending::Messages);
+            let actions = self.request(protocol::GET_ACTIONS, thread_body(&thread), Pending::Actions);
+            out.push(messages);
+            out.push(actions);
+            self.next_poll_ms = Some(now_ms + self.cfg.poll_interval_ms);
+        }
+    }
+
+    fn on_http(&mut self, response: HttpResponse, out: &mut Vec<Output>) {
+        let Some(kind) = self.inflight.remove(&response.id) else {
+            return;
+        };
+        let answer = frappe_message(&response);
+        match (kind, answer) {
+            (Pending::Send, Ok(message)) => {
+                // `start_or_resume_thread` gives the conversation id; `post_message` may repeat or change it.
+                match thread_id_of(&message).or_else(|| self.thread_id.clone()) {
+                    Some(thread) => {
+                        self.thread_id = Some(thread);
+                        self.next_poll_ms = Some(self.now_ms);
+                        self.last_activity_ms = self.now_ms;
+                        out.push(Output::Changed);
+                    }
+                    None => self.fail(NoraError::Malformed("no `thread_id` in the answer".into()), out),
+                }
+            }
+            (Pending::Send, Err(error)) => self.fail(error, out),
+            (Pending::Messages, Ok(message)) => {
+                self.last_error = None;
+                self.absorb_replies(&message, out);
+            }
+            (Pending::Actions, Ok(message)) => {
+                self.last_error = None;
+                for action in parse_actions(&message) {
+                    self.last_activity_ms = self.now_ms;
+                    self.handle_action(action, out);
+                }
+            }
+            (Pending::Messages | Pending::Actions, Err(error)) => {
+                self.last_error = Some(error.to_string());
+                out.push(Output::Changed);
+            }
+            (Pending::Observation, _) => {}
+        }
+    }
+
+    fn fail(&mut self, error: NoraError, out: &mut Vec<Output>) {
+        self.last_error = Some(error.to_string());
+        self.busy = false;
+        self.next_poll_ms = None;
+        out.push(Output::Changed);
+    }
+
+    /// Adds the replies the transcript has not seen. The server list holds Nora's replies only and
+    /// only grows, so the new ones are the tail; the user's own messages are added when sent.
+    fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) {
+        let (replies, _cards) = parse_messages(message);
+        let replies: Vec<ChatMessage> = replies.into_iter().filter(|reply| reply.role != Role::User).collect();
+        if replies.len() > self.known_replies {
+            self.transcript.extend(replies.iter().skip(self.known_replies).cloned());
+            self.known_replies = replies.len();
+            self.last_activity_ms = self.now_ms;
+            out.push(Output::Changed);
+        } else {
+            self.known_replies = replies.len();
+        }
+    }
+
+    fn handle_action(&mut self, action: RemoteAction, out: &mut Vec<Output>) {
+        match action {
+            RemoteAction::Unsupported { action, callback_id, reason } => {
+                if let Some(callback) = callback_id {
+                    self.answer_error(&callback, &format!("`{action}` is not available in the editor ({reason})"), out);
+                }
+            }
+            RemoteAction::Doc(doc) => {
+                let decision = self.decide(&doc.kind);
+                match decision {
+                    Decision::Deny => {
+                        if let Some(callback) = doc.callback_id.clone() {
+                            self.answer_error(&callback, &format!("refused by the editor's policy: {}", doc.kind.summary()), out);
+                        }
+                    }
+                    Decision::Confirm => {
+                        let id = self.new_id();
+                        self.waiting.push(Waiting { id, action: doc });
+                        out.push(Output::Changed);
+                    }
+                    Decision::Allow => self.run_document(doc, out),
+                }
+            }
+        }
+    }
+
+    fn decide(&self, kind: &DocActionKind) -> Decision {
+        match kind {
+            DocActionKind::Execute { command, .. } => self.cfg.policy.check(command),
+            DocActionKind::Batch { commands } => commands.iter().map(|call| self.cfg.policy.check(&call.command)).max().unwrap_or(Decision::Allow),
+            DocActionKind::Save => Decision::Confirm,
+            _ => Decision::Allow,
+        }
+    }
+
+    fn run_document(&mut self, action: DocAction, out: &mut Vec<Output>) {
+        let id = self.new_id();
+        self.running.insert(id, Running { callback_id: action.callback_id, modifies: action.kind.modifies(), summary: action.kind.summary() });
+        self.last_activity_ms = self.now_ms;
+        out.push(Output::Document(DocumentCall { id, kind: action.kind }));
+    }
+
+    fn answer_error(&mut self, callback_id: &str, message: &str, out: &mut Vec<Output>) {
+        let request = self.request(protocol::RECEIVE_OBSERVATION, observation_body(callback_id, &observation_error(message)), Pending::Observation);
+        out.push(request);
+    }
+
+    fn on_document_result(&mut self, id: u64, result: Result<Value, String>, out: &mut Vec<Output>) {
+        let Some(run) = self.running.remove(&id) else {
+            return;
+        };
+        self.last_activity_ms = self.now_ms;
+        let observation = match result {
+            Ok(value) => {
+                if run.modifies {
+                    self.changes.push(run.summary);
+                }
+                observation_ok(value)
+            }
+            Err(message) => {
+                self.last_error = Some(message.clone());
+                observation_error(&message)
+            }
+        };
+        if let Some(callback) = run.callback_id {
+            let request = self.request(protocol::RECEIVE_OBSERVATION, observation_body(&callback, &observation), Pending::Observation);
+            out.push(request);
+        }
+        out.push(Output::Changed);
+    }
+
+    fn on_confirm(&mut self, id: u64, accepted: bool, out: &mut Vec<Output>) {
+        let Some(position) = self.waiting.iter().position(|waiting| waiting.id == id) else {
+            return;
+        };
+        let waiting = self.waiting.remove(position);
+        if accepted {
+            self.run_document(waiting.action, out);
+        } else if let Some(callback) = waiting.action.callback_id {
+            self.answer_error(&callback, "the user declined", out);
+        }
+        out.push(Output::Changed);
+    }
+
+    fn on_undo(&mut self, out: &mut Vec<Output>) {
+        if self.changes.pop().is_some() {
+            self.run_document(DocAction { callback_id: None, kind: DocActionKind::Undo }, out);
+            out.push(Output::Changed);
+        }
+    }
+
+    fn on_reset(&mut self, out: &mut Vec<Output>) {
+        self.thread_id = None;
+        self.transcript.clear();
+        self.known_replies = 0;
+        self.busy = false;
+        self.last_error = None;
+        self.next_poll_ms = None;
+        self.inflight.clear();
+        self.running.clear();
+        self.waiting.clear();
+        self.changes.clear();
+        out.push(Output::Changed);
+    }
+}
