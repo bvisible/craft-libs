@@ -1,0 +1,58 @@
+# //// Neoffice — added file (no upstream equivalent)
+# Why: craft-nora and craft-nora-ui are ours (upstream has no equivalent) and upstream's workflows
+# only cover its own crates, so this runs the same checks on ours, crate by crate as upstream's do:
+# format, clippy without warnings, tests, and a wasm build (the Nora client core is meant to run in
+# the browser too). `cargo clippy --workspace` is deliberately not used: it fails on upstream code
+# that this fork does not touch.
+name: Neoffice Nora crates
+
+on:
+  push:
+    branches: [version-15]
+    paths: ["crates/nora/**", "crates/nora-ui/**", "Cargo.toml", "Cargo.lock", ".github/workflows/neoffice-nora.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neoffice-nora-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native:
+    name: Nora (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: neoffice-nora
+      - run: cargo fmt --check
+      - run: cargo clippy -p craft-nora -p craft-nora-ui --all-targets --locked -- -D warnings
+      - run: cargo test -p craft-nora -p craft-nora-ui --locked
+  wasm:
+    name: Nora WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: neoffice-nora-wasm
+      - run: cargo check -p craft-nora -p craft-nora-ui --locked --target wasm32-unknown-unknown
