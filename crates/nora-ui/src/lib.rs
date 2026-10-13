@@ -68,6 +68,7 @@ impl PanelAction {
 /// The words of the panel. English by default; an app fills in its own language.
 #[derive(Debug, Clone)]
 pub struct NoraLabels {
+    /// Left of the header buttons; leave it empty when the app draws its own title.
     pub title: String,
     pub new_conversation: String,
     pub undo: String,
@@ -210,7 +211,9 @@ impl NoraPanel {
 
     fn header(&self, ui: &mut Ui, session: &NoraSession, actions: &mut Vec<PanelAction>) {
         ui.horizontal(|ui| {
-            ui.strong(self.labels.title.as_str());
+            if !self.labels.title.is_empty() {
+                ui.strong(self.labels.title.as_str());
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let started = session.thread_id().is_some() || !session.transcript().is_empty();
                 if ui.add_enabled(started, Button::new(self.labels.new_conversation.as_str()).small()).clicked() {
