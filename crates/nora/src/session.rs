@@ -1,6 +1,6 @@
 // //// Neoffice — added file (no upstream equivalent): the conversation state machine of the Nora client core.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -10,7 +10,7 @@ use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
     self, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, observation_body, observation_error, observation_ok, parse_actions,
-    parse_messages, post_message_body, start_thread_body, thread_body, thread_id_of,
+    parse_messages, post_message_body, sent_at_of, start_thread_body, thread_body, thread_id_of,
 };
 
 /// How a session behaves. The defaults suit an editor talking to a Neoffice instance.
@@ -123,7 +123,12 @@ pub struct NoraSession {
     context: PageContext,
     thread_id: Option<String>,
     transcript: Vec<ChatMessage>,
+    /// Replies counted so far: the fallback when the server gives no send time.
     known_replies: usize,
+    /// The server time of the last send. A reply stamped after it is new.
+    sent_at: Option<f64>,
+    /// The replies already taken, by time and start, so a poll never adds one twice.
+    seen: HashSet<String>,
     busy: bool,
     last_error: Option<String>,
     now_ms: u64,
@@ -147,6 +152,8 @@ impl NoraSession {
             thread_id: None,
             transcript: Vec::new(),
             known_replies: 0,
+            sent_at: None,
+            seen: HashSet::new(),
             busy: false,
             last_error: None,
             now_ms: 0,
@@ -306,6 +313,7 @@ impl NoraSession {
                 match thread_id_of(&message).or_else(|| self.thread_id.clone()) {
                     Some(thread) => {
                         self.thread_id = Some(thread);
+                        self.sent_at = sent_at_of(&message);
                         self.next_poll_ms = Some(self.now_ms);
                         self.last_activity_ms = self.now_ms;
                         out.push(Output::Changed);
@@ -341,17 +349,15 @@ impl NoraSession {
     }
 
     /// Adds the replies the transcript has not seen. The server list holds Nora's replies only, in the
-    /// order they came, and only grows (a flushed cache may briefly show fewer, which never takes
-    /// anything back), so the new ones are the tail; the user's own messages are added when sent.
-    /// An acknowledgement is shown and the wait goes on; the first reply that is an answer ends it.
+    /// order they came; the user's own messages are added when sent. An acknowledgement is shown and
+    /// the wait goes on; the first reply that is an answer ends it.
     fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) {
         let (replies, _cards) = parse_messages(message);
         let replies: Vec<ChatMessage> = replies.into_iter().filter(|reply| reply.role != Role::User).collect();
-        if replies.len() <= self.known_replies {
+        let fresh = self.fresh_replies(replies);
+        if fresh.is_empty() {
             return;
         }
-        let fresh: Vec<ChatMessage> = replies.iter().skip(self.known_replies).cloned().collect();
-        self.known_replies = replies.len();
         self.last_activity_ms = self.now_ms;
         for reply in fresh {
             if self.final_seen_ms.is_none() && !self.is_interim(&reply) {
@@ -362,6 +368,23 @@ impl NoraSession {
             }
         }
         out.push(Output::Changed);
+    }
+
+    /// The replies of the list that are new. With the server time of the send, a reply stamped after
+    /// it is new whatever the buffer lost: the replies live in a cache that a clear can empty, and
+    /// counting positions then hides an answer that lands as the only message left. Without it
+    /// (an older server) the positions are counted, and the count never goes down.
+    fn fresh_replies(&mut self, replies: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        match self.sent_at {
+            Some(sent_at) => {
+                replies.into_iter().filter(|reply| reply.ts.is_none_or(|ts| ts > sent_at) && self.seen.insert(reply_key(reply))).collect()
+            }
+            None => {
+                let fresh = replies.iter().skip(self.known_replies).cloned().collect();
+                self.known_replies = self.known_replies.max(replies.len());
+                fresh
+            }
+        }
     }
 
     /// Whether a reply only says the request is being handled (or adds manual pages, or says nothing)
@@ -469,6 +492,8 @@ impl NoraSession {
         self.thread_id = None;
         self.transcript.clear();
         self.known_replies = 0;
+        self.sent_at = None;
+        self.seen.clear();
         self.busy = false;
         self.last_error = None;
         self.turn_started_ms = 0;
@@ -486,4 +511,10 @@ impl NoraSession {
 fn is_hidden(reply: &ChatMessage) -> bool {
     let text = reply.text.trim();
     text.is_empty() || text == "NO_REPLY"
+}
+
+/// What identifies a reply across polls: its server time and the start of its text.
+fn reply_key(reply: &ChatMessage) -> String {
+    let start: String = reply.text.chars().take(40).collect();
+    format!("{:?}|{start}", reply.ts.map(f64::to_bits))
 }

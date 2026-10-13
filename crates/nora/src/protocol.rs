@@ -89,6 +89,8 @@ pub struct ChatMessage {
     pub followups: Vec<String>,
     /// The reply carries manual pages and says nothing itself: an addition to an answer, never the answer.
     pub sources_only: bool,
+    /// When the server buffered the reply, in epoch seconds. A reply stamped after a send is new.
+    pub ts: Option<f64>,
     /// The message as Nora sent it, for whatever the panel learns to show later.
     pub raw: Value,
 }
@@ -97,7 +99,7 @@ impl ChatMessage {
     /// A message the user just typed.
     pub fn user(text: impl Into<String>) -> Self {
         let text = text.into();
-        ChatMessage { role: Role::User, raw: json!({ "role": "user", "text": text }), text, followups: Vec::new(), sources_only: false }
+        ChatMessage { role: Role::User, raw: json!({ "role": "user", "text": text }), text, followups: Vec::new(), sources_only: false, ts: None }
     }
 
     /// Reads one buffered message. Nora's replies carry `role`, `author`, `content` and `text`, the
@@ -111,7 +113,14 @@ impl ChatMessage {
             _ => Role::Other,
         };
         let block = split_nora_block(&content_of(value));
-        ChatMessage { role, text: block.text, followups: block.followups, sources_only: block.sources_only, raw: value.clone() }
+        ChatMessage {
+            role,
+            text: block.text,
+            followups: block.followups,
+            sources_only: block.sources_only,
+            ts: value.get("ts").and_then(Value::as_f64),
+            raw: value.clone(),
+        }
     }
 }
 
@@ -190,6 +199,13 @@ fn find_comment(lower: &str) -> Option<(usize, (usize, usize), usize)> {
 /// The conversation id in the answer of `start_or_resume_thread`.
 pub fn parse_thread_id(message: &Value) -> Result<String, NoraError> {
     thread_id_of(message).ok_or_else(|| NoraError::Malformed("no `thread_id` in the answer".into()))
+}
+
+/// The server time of a send, in epoch seconds: `start_or_resume_thread` and `post_message` return it
+/// so that a client keeps the replies stamped after it instead of counting positions in a buffer that
+/// a cache clear can empty (a clear once hid an answer that was the only message left).
+pub fn sent_at_of(message: &Value) -> Option<f64> {
+    message.get("sent_at").and_then(Value::as_f64)
 }
 
 /// The conversation id of any answer that carries one (`post_message` may change it).
@@ -468,6 +484,14 @@ mod tests {
         assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "body": "corps"})).text, "corps");
         assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "content": "", "text": "repli"})).text, "repli");
         assert_eq!(ChatMessage::from_json(&json!({})).text, "");
+    }
+
+    #[test]
+    fn replies_carry_their_server_time_and_sends_return_theirs() {
+        assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "text": "Oui", "ts": 1760000000.5})).ts, Some(1_760_000_000.5));
+        assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "text": "Oui"})).ts, None);
+        assert_eq!(sent_at_of(&json!({"thread_id": "t", "sent_at": 12.5})), Some(12.5));
+        assert_eq!(sent_at_of(&json!({"thread_id": "t"})), None);
     }
 
     #[test]

@@ -39,6 +39,15 @@ fn started() -> NoraSession {
     nora
 }
 
+/// Like [`started`], with the server time of the send in the answer, as the real server gives it.
+fn started_at(sent_at: f64) -> NoraSession {
+    let mut nora = session();
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    let start = request_to(&sent, protocol::START_OR_RESUME_THREAD).clone();
+    nora.handle(ok(&start, json!({"thread_id": "t1", "sent_at": sent_at})));
+    nora
+}
+
 /// Runs one poll at `now`, answering the replies request with `replies` and the action queue with `actions`.
 /// Returns what the answers to the action queue produced.
 fn poll(nora: &mut NoraSession, now: u64, replies: Value, actions: Value) -> Vec<Output> {
@@ -194,6 +203,55 @@ fn a_follow_up_waits_for_its_own_answer() {
     assert!(nora.is_busy());
     let second = json!({"role": "assistant", "text": "Seconde réponse."});
     poll(&mut nora, 7_100, json!([first, second]), json!([]));
+    nora.handle(Input::Tick { now_ms: 9_000 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Seconde réponse."));
+}
+
+#[test]
+fn with_the_send_time_only_replies_stamped_after_it_are_new() {
+    let mut nora = started_at(1_000.0);
+    let old = json!({"role": "assistant", "text": "Ancienne réponse", "ts": 900.0});
+    let new = json!({"role": "assistant", "text": "Nouvelle réponse", "ts": 1_001.0});
+    poll(&mut nora, 100, json!([old, new]), json!([]));
+    assert_eq!(nora.transcript().len(), 2, "the user's message and the new reply");
+    assert_eq!(nora.transcript()[1].text, "Nouvelle réponse");
+    // Read again: nothing is added twice.
+    poll(&mut nora, 600, json!([old, new]), json!([]));
+    assert_eq!(nora.transcript().len(), 2);
+}
+
+#[test]
+fn a_flushed_buffer_does_not_hide_the_answer() {
+    // The replies live in a cache that a clear can empty. Counting positions would miss an answer that
+    // lands as the only message left; its time says it is new.
+    let mut nora = started_at(1_000.0);
+    let ack = json!({"role": "assistant", "text": "Je transmets votre demande à votre pôle Ventes.", "ts": 1_000.5});
+    let answer = json!({"role": "assistant", "text": "253 devis ouverts.", "ts": 1_030.0});
+    poll(&mut nora, 500, json!([ack]), json!([]));
+    poll(&mut nora, 4_000, json!([]), json!([]));
+    poll(&mut nora, 31_000, json!([answer]), json!([]));
+    let texts: Vec<&str> = nora.transcript().iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, vec!["Bonjour", "Je transmets votre demande à votre pôle Ventes.", "253 devis ouverts."]);
+    nora.handle(Input::Tick { now_ms: 33_000 });
+    assert!(!nora.is_busy());
+}
+
+#[test]
+fn each_send_has_its_own_send_time() {
+    let mut nora = started_at(1_000.0);
+    let first = json!({"role": "assistant", "text": "Première réponse.", "ts": 1_002.0});
+    poll(&mut nora, 100, json!([first]), json!([]));
+    nora.handle(Input::Tick { now_ms: 2_000 });
+    assert!(!nora.is_busy());
+    let sent = nora.handle(Input::Send("Et ensuite ?".into()));
+    nora.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1", "sent_at": 2_000.0})));
+    // The first answer is older than this send, so it does not end the second turn.
+    poll(&mut nora, 2_100, json!([first]), json!([]));
+    poll(&mut nora, 6_000, json!([first]), json!([]));
+    assert!(nora.is_busy());
+    let second = json!({"role": "assistant", "text": "Seconde réponse.", "ts": 2_006.0});
+    poll(&mut nora, 7_000, json!([first, second]), json!([]));
     nora.handle(Input::Tick { now_ms: 9_000 });
     assert!(!nora.is_busy());
     assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Seconde réponse."));

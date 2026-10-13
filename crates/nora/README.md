@@ -47,6 +47,10 @@ for output in nora.handle(Input::Send("Rewrite the first paragraph".into())) {
   that is an answer ends the wait, after a moment (`settle_ms`) for the actions queued with it. The
   phrases that mark an acknowledgement are `protocol::ACK_ANCHORS`, a copy of the server's list; a
   host that has the live one (`frappe.boot.nora_ack_anchors`) passes it in `SessionConfig::ack_anchors`.
+- **A reply is new when the server stamped it after the send** (`sent_at` in the answer of the send,
+  `ts` on the reply), not when it sits past a position in the list: the replies live in a cache that
+  a clear can empty, and counting positions then hides an answer that lands as the only message
+  left. Without `sent_at` (an older server) the positions are counted.
 - The replies are read often at first (400 ms for three seconds), then every second until fifteen
   seconds, then every three. Eight minutes without a reply or an action end the wait with an error.
 - A reply may end with a machine block (a ```` ```nora ```` fence or a `<!-- nora: … -->` comment) that
