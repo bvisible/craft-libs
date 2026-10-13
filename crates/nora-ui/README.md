@@ -31,6 +31,7 @@ waiting for something, so an event-driven host keeps polling Nora without a time
 - A transcript with the user's messages on the right and Nora's on the left, a spinner while Nora
   works, the last error, and a field at the bottom: **Enter sends, Shift+Enter starts a new line**
   (an Enter that confirms an input-method composition is left alone).
+- While Nora works the **Send** button and Enter wait, and the message stays in the box, as in the desk's chat.
 - A card with **Allow** and **Refuse** when Nora asks to do something that needs a yes (saving, a
   command the policy flags).
 - **Undo** for Nora's last change and **New conversation**.

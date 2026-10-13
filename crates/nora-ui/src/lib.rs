@@ -204,7 +204,7 @@ impl NoraPanel {
         // transcript takes what is left above it.
         Panel::bottom(id.with("input-panel"))
             .frame(Frame::new().inner_margin(Margin::symmetric(0, 6)))
-            .show(ui, |ui| self.input_row(ui, id.with("input"), &mut actions));
+            .show(ui, |ui| self.input_row(ui, id.with("input"), session.is_busy(), &mut actions));
         CentralPanel::no_frame().show(ui, |ui| self.transcript(ui, session, &colors, &mut actions));
         actions
     }
@@ -303,7 +303,9 @@ impl NoraPanel {
         ui.add_space(ui.spacing().item_spacing.y);
     }
 
-    fn input_row(&mut self, ui: &mut Ui, input_id: Id, actions: &mut Vec<PanelAction>) {
+    /// The text box and the Send button. While Nora works (`busy`) the message waits in the box, as in
+    /// the desk's chat, which locks its field until the answer is in.
+    fn input_row(&mut self, ui: &mut Ui, input_id: Id, busy: bool, actions: &mut Vec<PanelAction>) {
         if let Some(reason) = self.offline.as_deref() {
             self.focus_input = false;
             ui.add(Label::new(RichText::new(reason).weak()).wrap());
@@ -317,7 +319,7 @@ impl NoraPanel {
         ui.horizontal(|ui| {
             // Right to left so that the button takes its own width and the text box the rest.
             ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-                let can_send = !self.draft.trim().is_empty();
+                let can_send = !busy && !self.draft.trim().is_empty();
                 send_clicked = ui.add_enabled(can_send, Button::new(self.labels.send.as_str())).clicked();
                 // Plain Enter is handled below: only Shift+Enter is a new line.
                 let output = TextEdit::multiline(&mut self.draft)
@@ -332,7 +334,7 @@ impl NoraPanel {
         });
         // After the text box, so that text typed in the same frame is already in the draft.
         let enter = typing && take_enter(ui);
-        if (send_clicked || enter) && !self.draft.trim().is_empty() {
+        if (send_clicked || enter) && !busy && !self.draft.trim().is_empty() {
             let text = std::mem::take(&mut self.draft);
             actions.push(PanelAction::Send(text.trim().to_string()));
             self.scroll_to_end = true;
@@ -420,9 +422,9 @@ mod tests {
     /// Puts the keyboard in the text box and types, the way a user does.
     fn type_into_the_box(h: &mut Harness<'_, State>, text: &str) {
         h.get_by_role(egui::accesskit::Role::MultilineTextInput).focus();
-        h.run();
+        h.run_steps(3);
         h.get_by_role(egui::accesskit::Role::MultilineTextInput).type_text(text);
-        h.run();
+        h.run_steps(3);
     }
 
     fn harness(session: NoraSession) -> Harness<'static, State> {
@@ -504,6 +506,21 @@ mod tests {
         assert!(h.query_by_role(egui::accesskit::Role::MultilineTextInput).is_none());
         assert!(h.query_by_label("Send").is_none());
         assert!(h.state().actions.is_empty());
+    }
+
+    #[test]
+    fn while_nora_works_the_message_waits_in_the_box() {
+        let mut nora = session();
+        nora.handle(Input::Send("First".into()));
+        assert!(nora.is_busy());
+        let mut h = harness(nora);
+        h.run_steps(2);
+        type_into_the_box(&mut h, "Second");
+        h.key_press(Key::Enter);
+        h.run_steps(3);
+        assert!(h.state().actions.is_empty(), "Enter does not send while Nora works");
+        assert_eq!(h.state().panel.draft(), "Second", "and the message is still there");
+        assert!(h.get_by_label("Send").accesskit_node().is_disabled());
     }
 
     #[test]

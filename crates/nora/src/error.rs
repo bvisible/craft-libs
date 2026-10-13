@@ -12,6 +12,8 @@ pub enum NoraError {
     Server(String),
     /// The answer was not what the protocol promises.
     Malformed(String),
+    /// Nora said nothing for longer than the session waits.
+    Timeout,
 }
 
 impl NoraError {
@@ -27,6 +29,7 @@ impl fmt::Display for NoraError {
             NoraError::Http(status) => write!(f, "the server answered HTTP {status}"),
             NoraError::Server(message) => write!(f, "{message}"),
             NoraError::Malformed(what) => write!(f, "unexpected answer from Nora: {what}"),
+            NoraError::Timeout => write!(f, "Nora did not answer in time"),
         }
     }
 }

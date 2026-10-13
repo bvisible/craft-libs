@@ -18,15 +18,34 @@ use crate::protocol::{
 pub struct SessionConfig {
     /// What Nora may play in the document.
     pub policy: CommandPolicy,
-    /// Time between two reads of the replies and of the action queue while Nora works.
-    pub poll_interval_ms: u64,
-    /// How long without a reply or an action before Nora is considered done.
-    pub idle_after_ms: u64,
+    /// Time between two reads of the replies and of the action queue in the first three seconds of
+    /// a turn: a greeting or an acknowledgement is there within a second.
+    pub poll_fast_ms: u64,
+    /// The same up to fifteen seconds into the turn.
+    pub poll_mid_ms: u64,
+    /// The same after that. A business desk answers 10 to 70 seconds after its acknowledgement.
+    pub poll_slow_ms: u64,
+    /// How long without a reply or an action before Nora is given up on. Eight minutes, as the
+    /// desk's chat waits: a worker retried after a crash answered after three and a half.
+    pub max_silence_ms: u64,
+    /// How long the turn stays open after the final reply, for the actions queued with it.
+    pub settle_ms: u64,
+    /// Lowercase phrases that mark an acknowledgement rather than an answer. Defaults to
+    /// [`protocol::ACK_ANCHORS`]; a host that has the server's live list passes it here.
+    pub ack_anchors: Vec<String>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        SessionConfig { policy: CommandPolicy::default(), poll_interval_ms: 1_500, idle_after_ms: 10_000 }
+        SessionConfig {
+            policy: CommandPolicy::default(),
+            poll_fast_ms: 400,
+            poll_mid_ms: 1_000,
+            poll_slow_ms: 3_000,
+            max_silence_ms: 480_000,
+            settle_ms: 1_500,
+            ack_anchors: protocol::ACK_ANCHORS.iter().map(|anchor| anchor.to_string()).collect(),
+        }
     }
 }
 
@@ -109,6 +128,9 @@ pub struct NoraSession {
     last_error: Option<String>,
     now_ms: u64,
     last_activity_ms: u64,
+    turn_started_ms: u64,
+    /// When the first reply that is an answer, not an acknowledgement, came in.
+    final_seen_ms: Option<u64>,
     next_poll_ms: Option<u64>,
     next_id: u64,
     inflight: HashMap<RequestId, Pending>,
@@ -129,6 +151,8 @@ impl NoraSession {
             last_error: None,
             now_ms: 0,
             last_activity_ms: 0,
+            turn_started_ms: 0,
+            final_seen_ms: None,
             next_poll_ms: None,
             next_id: 0,
             inflight: HashMap::new(),
@@ -214,6 +238,8 @@ impl NoraSession {
         self.busy = true;
         self.last_error = None;
         self.last_activity_ms = self.now_ms;
+        self.turn_started_ms = self.now_ms;
+        self.final_seen_ms = None;
         let request = match self.thread_id.clone() {
             Some(thread) => self.request(protocol::POST_MESSAGE, post_message_body(&thread, &text, &self.context), Pending::Send),
             None => self.request(protocol::START_OR_RESUME_THREAD, start_thread_body(&text, &self.context), Pending::Send),
@@ -227,14 +253,19 @@ impl NoraSession {
         if !self.busy {
             return;
         }
-        // Done first: a quiet turn with nothing pending ends without one more poll.
-        let quiet = now_ms.saturating_sub(self.last_activity_ms) >= self.cfg.idle_after_ms;
-        let nothing_pending =
-            self.inflight.values().all(|pending| matches!(pending, Pending::Observation)) && self.running.is_empty() && self.waiting.is_empty();
-        if quiet && nothing_pending {
-            self.busy = false;
-            self.next_poll_ms = None;
-            out.push(Output::Changed);
+        let nothing_running = self.running.is_empty() && self.waiting.is_empty();
+        let nothing_pending = nothing_running && self.inflight.values().all(|pending| matches!(pending, Pending::Observation));
+        // Done first, so that a finished turn ends without one more poll. The final reply is in and the
+        // actions queued with it have had their moment...
+        let settled = self.final_seen_ms.is_some_and(|seen| now_ms.saturating_sub(seen) >= self.cfg.settle_ms);
+        if nothing_pending && settled {
+            self.finish(out);
+            return;
+        }
+        // ...or nothing came for too long (an acknowledgement alone is not an answer). A call the host
+        // never answered does not hold this back: only an action running or waiting for the user does.
+        if nothing_running && now_ms.saturating_sub(self.last_activity_ms) >= self.cfg.max_silence_ms {
+            self.fail(NoraError::Timeout, out);
             return;
         }
         if let Some(thread) = self.thread_id.clone()
@@ -245,8 +276,23 @@ impl NoraSession {
             let actions = self.request(protocol::GET_ACTIONS, thread_body(&thread), Pending::Actions);
             out.push(messages);
             out.push(actions);
-            self.next_poll_ms = Some(now_ms + self.cfg.poll_interval_ms);
+            self.next_poll_ms = Some(now_ms + self.poll_delay(now_ms));
         }
+    }
+
+    /// Time to the next read: often at first, then less, as the desk's chat does.
+    fn poll_delay(&self, now_ms: u64) -> u64 {
+        match now_ms.saturating_sub(self.turn_started_ms) {
+            0..3_000 => self.cfg.poll_fast_ms,
+            3_000..15_000 => self.cfg.poll_mid_ms,
+            _ => self.cfg.poll_slow_ms,
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<Output>) {
+        self.busy = false;
+        self.next_poll_ms = None;
+        out.push(Output::Changed);
     }
 
     fn on_http(&mut self, response: HttpResponse, out: &mut Vec<Output>) {
@@ -294,19 +340,38 @@ impl NoraSession {
         out.push(Output::Changed);
     }
 
-    /// Adds the replies the transcript has not seen. The server list holds Nora's replies only and
-    /// only grows, so the new ones are the tail; the user's own messages are added when sent.
+    /// Adds the replies the transcript has not seen. The server list holds Nora's replies only, in the
+    /// order they came, and only grows (a flushed cache may briefly show fewer, which never takes
+    /// anything back), so the new ones are the tail; the user's own messages are added when sent.
+    /// An acknowledgement is shown and the wait goes on; the first reply that is an answer ends it.
     fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) {
         let (replies, _cards) = parse_messages(message);
         let replies: Vec<ChatMessage> = replies.into_iter().filter(|reply| reply.role != Role::User).collect();
-        if replies.len() > self.known_replies {
-            self.transcript.extend(replies.iter().skip(self.known_replies).cloned());
-            self.known_replies = replies.len();
-            self.last_activity_ms = self.now_ms;
-            out.push(Output::Changed);
-        } else {
-            self.known_replies = replies.len();
+        if replies.len() <= self.known_replies {
+            return;
         }
+        let fresh: Vec<ChatMessage> = replies.iter().skip(self.known_replies).cloned().collect();
+        self.known_replies = replies.len();
+        self.last_activity_ms = self.now_ms;
+        for reply in fresh {
+            if self.final_seen_ms.is_none() && !self.is_interim(&reply) {
+                self.final_seen_ms = Some(self.now_ms);
+            }
+            if !is_hidden(&reply) {
+                self.transcript.push(reply);
+            }
+        }
+        out.push(Output::Changed);
+    }
+
+    /// Whether a reply only says the request is being handled (or adds manual pages, or says nothing)
+    /// and the answer is still to come.
+    fn is_interim(&self, reply: &ChatMessage) -> bool {
+        if reply.sources_only || reply.text.trim().is_empty() || reply.text.contains("NO_REPLY") {
+            return true;
+        }
+        let lowered = reply.text.to_lowercase().replace('\u{2019}', "'");
+        self.cfg.ack_anchors.iter().any(|anchor| lowered.contains(anchor.as_str()))
     }
 
     fn handle_action(&mut self, action: RemoteAction, out: &mut Vec<Output>) {
@@ -406,6 +471,8 @@ impl NoraSession {
         self.known_replies = 0;
         self.busy = false;
         self.last_error = None;
+        self.turn_started_ms = 0;
+        self.final_seen_ms = None;
         self.next_poll_ms = None;
         self.inflight.clear();
         self.running.clear();
@@ -413,4 +480,10 @@ impl NoraSession {
         self.changes.clear();
         out.push(Output::Changed);
     }
+}
+
+/// A reply with nothing to show: empty, or the marker Nora uses for "nothing to say".
+fn is_hidden(reply: &ChatMessage) -> bool {
+    let text = reply.text.trim();
+    text.is_empty() || text == "NO_REPLY"
 }

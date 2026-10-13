@@ -72,27 +72,142 @@ fn blank_messages_are_not_sent() {
 }
 
 #[test]
-fn replies_arrive_by_polling_and_the_turn_ends_when_nora_goes_quiet() {
+fn replies_arrive_by_polling_and_the_turn_ends_once_the_final_reply_has_settled() {
     let mut nora = started();
     assert_eq!(nora.thread_id(), Some("t1"));
-    poll(&mut nora, 1_000, json!([{"role": "assistant", "text": "Voici une version plus courte."}]), json!([]));
+    let reply = json!({"role": "assistant", "text": "Voici une version plus courte."});
+    poll(&mut nora, 1_000, json!([reply]), json!([]));
     assert_eq!(nora.transcript().len(), 2);
     assert_eq!(nora.transcript()[1].text, "Voici une version plus courte.");
+    // The final reply is in, but the actions queued with it get a moment to arrive.
     assert!(nora.is_busy());
-    // Not due yet, then due again; a repeated reply is not added twice.
-    assert!(requests(&nora.handle(Input::Tick { now_ms: 1_500 })).is_empty());
-    poll(
-        &mut nora,
-        2_600,
-        json!([{"role": "assistant", "text": "Voici une version plus courte."}, {"role": "assistant", "text": "Autre chose ?"}]),
-        json!([]),
-    );
-    assert_eq!(nora.transcript().len(), 3);
-    // Quiet for ten seconds after the last reply.
-    let done = nora.handle(Input::Tick { now_ms: 13_000 });
+    // The first seconds are read every 400 ms: not due yet, then due; a repeated reply is not added twice.
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 1_200 })).is_empty());
+    poll(&mut nora, 1_500, json!([reply]), json!([]));
+    assert_eq!(nora.transcript().len(), 2);
+    // Settled: the turn ends.
+    let done = nora.handle(Input::Tick { now_ms: 2_600 });
     assert!(!nora.is_busy());
     assert!(done.contains(&Output::Changed));
     assert_eq!(nora.next_wake_ms(), None);
+}
+
+#[test]
+fn an_acknowledgement_is_shown_but_does_not_end_the_wait_for_the_real_answer() {
+    let mut nora = started();
+    let ack = json!({"role": "assistant", "text": "Je transmets votre demande à votre pôle Comptabilité, je reviens vers vous."});
+    poll(&mut nora, 500, json!([ack]), json!([]));
+    assert_eq!(nora.transcript().len(), 2, "the acknowledgement is shown");
+    // The specialist takes its time: still waiting after 20 s and after 40 s.
+    poll(&mut nora, 20_000, json!([ack]), json!([]));
+    poll(&mut nora, 25_000, json!([ack]), json!([]));
+    assert!(nora.is_busy());
+    let answer = json!({"role": "assistant", "text": "253 devis ouverts."});
+    poll(&mut nora, 40_000, json!([ack, answer]), json!([]));
+    assert_eq!(nora.transcript().len(), 3);
+    assert_eq!(nora.transcript()[2].text, "253 devis ouverts.");
+    assert!(nora.is_busy(), "the answer settles first");
+    nora.handle(Input::Tick { now_ms: 42_000 });
+    assert!(!nora.is_busy());
+}
+
+#[test]
+fn the_acknowledgements_of_every_language_are_recognised_and_a_real_answer_is_not() {
+    for text in ["I'm passing this to your Sales desk", "Ich leite Ihre Anfrage weiter", "Inoltro la sua richiesta", "Je confie ça à votre pôle"] {
+        let mut nora = started();
+        poll(&mut nora, 500, json!([{"role": "assistant", "text": text}]), json!([]));
+        nora.handle(Input::Tick { now_ms: 5_000 });
+        assert!(nora.is_busy(), "{text:?} is an acknowledgement");
+    }
+    let mut nora = started();
+    poll(&mut nora, 500, json!([{"role": "assistant", "text": "Le chiffre d'affaires du mois en cours est de 517 CHF."}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    assert!(!nora.is_busy(), "a real answer that mentions the current month ends the turn");
+}
+
+#[test]
+fn a_host_can_pass_the_servers_live_list_of_acknowledgements() {
+    let config = SessionConfig { ack_anchors: vec!["un instant".into()], ..SessionConfig::default() };
+    let mut nora = NoraSession::new(config, context());
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    nora.handle(ok(request_to(&sent, protocol::START_OR_RESUME_THREAD), json!({"thread_id": "t1"})));
+    poll(&mut nora, 500, json!([{"role": "assistant", "text": "Un instant, je regarde."}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    assert!(nora.is_busy());
+}
+
+#[test]
+fn silence_ends_the_wait_with_an_error_after_eight_minutes() {
+    let mut nora = started();
+    poll(&mut nora, 100, json!([]), json!([]));
+    nora.handle(Input::Tick { now_ms: 479_000 });
+    assert!(nora.is_busy());
+    // Even with a poll the host never answered, the wait does end.
+    let outputs = nora.handle(Input::Tick { now_ms: 480_100 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
+    assert!(outputs.contains(&Output::Changed));
+}
+
+#[test]
+fn replies_that_say_nothing_are_not_shown_and_do_not_end_the_wait() {
+    let mut nora = started();
+    poll(&mut nora, 500, json!([{"role": "assistant", "text": "NO_REPLY"}, {"role": "assistant", "content": ""}]), json!([]));
+    assert_eq!(nora.transcript().len(), 1, "only the user's own message");
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    assert!(nora.is_busy());
+}
+
+#[test]
+fn a_machine_block_never_reaches_the_transcript() {
+    let mut nora = started();
+    let reply = "Voici le total.\n```nora\n{\"followups\": [\"Et le mois dernier ?\"]}\n```";
+    poll(&mut nora, 500, json!([{"role": "assistant", "text": reply}]), json!([]));
+    assert_eq!(nora.transcript()[1].text, "Voici le total.");
+    assert_eq!(nora.transcript()[1].followups, vec!["Et le mois dernier ?"]);
+}
+
+#[test]
+fn a_buffer_that_briefly_shrinks_does_not_repeat_replies() {
+    let mut nora = started();
+    let (one, two) = (json!({"role": "assistant", "text": "Un"}), json!({"role": "assistant", "text": "Deux"}));
+    poll(&mut nora, 100, json!([one, two]), json!([]));
+    assert_eq!(nora.transcript().len(), 3);
+    // The cache lost a reply for a moment, then got it back.
+    poll(&mut nora, 600, json!([one]), json!([]));
+    poll(&mut nora, 1_100, json!([one, two]), json!([]));
+    assert_eq!(nora.transcript().len(), 3);
+}
+
+#[test]
+fn a_follow_up_waits_for_its_own_answer() {
+    let mut nora = started();
+    let first = json!({"role": "assistant", "text": "Première réponse."});
+    poll(&mut nora, 100, json!([first]), json!([]));
+    nora.handle(Input::Tick { now_ms: 2_000 });
+    assert!(!nora.is_busy());
+    let sent = nora.handle(Input::Send("Et ensuite ?".into()));
+    nora.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1"})));
+    // The buffer still holds only the first answer: the second turn goes on waiting.
+    poll(&mut nora, 2_100, json!([first]), json!([]));
+    poll(&mut nora, 6_000, json!([first]), json!([]));
+    assert!(nora.is_busy());
+    let second = json!({"role": "assistant", "text": "Seconde réponse."});
+    poll(&mut nora, 7_100, json!([first, second]), json!([]));
+    nora.handle(Input::Tick { now_ms: 9_000 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Seconde réponse."));
+}
+
+#[test]
+fn the_buffer_is_read_often_at_first_then_less() {
+    let mut nora = started();
+    let mut wakes = Vec::new();
+    for now in [0, 3_000, 15_000] {
+        poll(&mut nora, now, json!([]), json!([]));
+        wakes.push(nora.next_wake_ms().map(|wake| wake - now));
+    }
+    assert_eq!(wakes, vec![Some(400), Some(1_000), Some(3_000)]);
 }
 
 #[test]
@@ -231,8 +346,8 @@ fn saving_always_waits_for_the_user_and_can_be_declined() {
     let waiting = nora.confirmations();
     assert_eq!(waiting.len(), 2);
     assert_eq!(waiting[0].summary, "Save the document");
-    // The turn stays open while an answer is pending, however quiet it is.
-    nora.handle(Input::Tick { now_ms: 60_000 });
+    // The turn stays open while an answer is pending, however quiet it is (even past the eight minutes).
+    nora.handle(Input::Tick { now_ms: 600_000 });
     assert!(nora.is_busy());
     // Yes runs it; no tells Nora.
     let accepted = nora.handle(Input::Confirm { id: waiting[0].id, accepted: true });

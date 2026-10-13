@@ -39,6 +39,20 @@ for output in nora.handle(Input::Send("Rewrite the first paragraph".into())) {
 | `context` | `PageContext`: which editor and document the user is in, sent with every message |
 | `http`, `error` | the I/O-free request and answer types, Frappe's `message` envelope, errors a panel can show |
 
+## How a turn goes (read from the desk's own chat and the server)
+
+- The server answers a message at once with an **acknowledgement** in the user's language ("Je
+  transmets votre demande à votre pôle…") and the desk's real answer lands 10 to 70 seconds later in
+  the same conversation. The session shows the acknowledgement and **keeps waiting**; the first reply
+  that is an answer ends the wait, after a moment (`settle_ms`) for the actions queued with it. The
+  phrases that mark an acknowledgement are `protocol::ACK_ANCHORS`, a copy of the server's list; a
+  host that has the live one (`frappe.boot.nora_ack_anchors`) passes it in `SessionConfig::ack_anchors`.
+- The replies are read often at first (400 ms for three seconds), then every second until fifteen
+  seconds, then every three. Eight minutes without a reply or an action end the wait with an error.
+- A reply may end with a machine block (a ```` ```nora ```` fence or a `<!-- nora: … -->` comment) that
+  carries result cards, follow-up questions and manual pages for the desk: the text is shown without
+  it, the follow-ups are kept in `ChatMessage::followups`. `NO_REPLY` and empty replies are not shown.
+
 ## Rules the core enforces
 
 - Nora edits the document that is open. Commands that open, save, close or quit are refused by the

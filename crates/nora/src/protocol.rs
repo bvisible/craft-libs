@@ -16,6 +16,29 @@ pub const GET_ACTIONS: &str = "/api/method/nora.api.chat.get_browser_actions";
 /// Answers an observation Nora asked for, by its `callback_id` (kept one minute).
 pub const RECEIVE_OBSERVATION: &str = "/api/method/nora.api.page_observation.receive_observation";
 
+/// What the gateway answers at once, in the user's language, when a request is handed to a business
+/// desk ("Je transmets votre demande à votre pôle…"); the desk's real answer lands 10 to 70 seconds
+/// later in the same conversation. A client that waits for "the reply" must skip these, or the ack
+/// becomes the reply and the answer is never shown. Lowercase, narrow on purpose (a broad word also
+/// matches a real answer). Mirrors the server's own list (`nora.utils.routing_ack.ACK_ANCHORS`); a
+/// host that has the live one (`frappe.boot.nora_ack_anchors`) passes it in `SessionConfig`.
+pub const ACK_ANCHORS: &[&str] = &[
+    "je confie",
+    "m'en occupe",
+    "je m'en charge",
+    "je m'occupe",
+    "je transmets",
+    "je transfère",
+    "réponse dans un instant",
+    "je reviens vers vous",
+    "ich leite ihre anfrage",
+    "ich melde mich gleich",
+    "inoltro la sua richiesta",
+    "torno subito da lei",
+    "i'm passing this to your",
+    "i'll be right back with you",
+];
+
 /// The body of the call that opens a conversation. `block: 0` because an editor polls; the default
 /// would hold the request until Nora answers.
 pub fn start_thread_body(message: &str, context: &PageContext) -> Value {
@@ -60,7 +83,12 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
+    /// What the panel shows: the message without the machine block Nora may end it with.
     pub text: String,
+    /// Follow-up questions Nora suggests with the reply (four at most).
+    pub followups: Vec<String>,
+    /// The reply carries manual pages and says nothing itself: an addition to an answer, never the answer.
+    pub sources_only: bool,
     /// The message as Nora sent it, for whatever the panel learns to show later.
     pub raw: Value,
 }
@@ -69,11 +97,12 @@ impl ChatMessage {
     /// A message the user just typed.
     pub fn user(text: impl Into<String>) -> Self {
         let text = text.into();
-        ChatMessage { role: Role::User, raw: json!({ "role": "user", "text": text }), text }
+        ChatMessage { role: Role::User, raw: json!({ "role": "user", "text": text }), text, followups: Vec::new(), sources_only: false }
     }
 
-    /// Reads one buffered message. Nora's replies carry `role`, `author`, `content` and `text`;
-    /// the text is `text`, else `content`.
+    /// Reads one buffered message. Nora's replies carry `role`, `author`, `content` and `text`, the
+    /// last two the same; the text is read as the desk's chat reads it: `content`, else `text`, else
+    /// `body`, a list of parts being joined. A machine block at the end is taken out of it.
     pub fn from_json(value: &Value) -> Self {
         let role = match value.get("role").and_then(Value::as_str) {
             Some("user") => Role::User,
@@ -81,9 +110,81 @@ impl ChatMessage {
             Some("system") => Role::System,
             _ => Role::Other,
         };
-        let text = ["text", "content"].iter().find_map(|key| value.get(*key).and_then(Value::as_str)).unwrap_or_default().to_string();
-        ChatMessage { role, text, raw: value.clone() }
+        let block = split_nora_block(&content_of(value));
+        ChatMessage { role, text: block.text, followups: block.followups, sources_only: block.sources_only, raw: value.clone() }
     }
+}
+
+/// The text of a buffered message, as the desk's chat reads it.
+fn content_of(value: &Value) -> String {
+    for key in ["content", "text", "body"] {
+        match value.get(key) {
+            Some(Value::String(text)) if !text.is_empty() => return text.clone(),
+            Some(Value::Array(parts)) => {
+                let joined: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|part| part.get("content").or_else(|| part.get("text")).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .collect();
+                if !joined.is_empty() {
+                    return joined.join("\n");
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+struct NoraBlock {
+    text: String,
+    followups: Vec<String>,
+    sources_only: bool,
+}
+
+/// Nora may end a reply with a machine block, a ```` ```nora ```` fence or a `<!-- nora: … -->`
+/// comment holding JSON with result cards, follow-up questions and manual pages for the desk. The
+/// panel shows the text without it. A block that isn't valid JSON stays in the text, as on the desk.
+fn split_nora_block(text: &str) -> NoraBlock {
+    let plain = || NoraBlock { text: text.to_string(), followups: Vec::new(), sources_only: false };
+    // ASCII lowercasing keeps every byte offset, so what is found here cuts the original too.
+    let lower = text.to_ascii_lowercase();
+    let Some((start, inner, end)) = find_fence(&lower).or_else(|| find_comment(&lower)) else {
+        return plain();
+    };
+    let Ok(Value::Object(data)) = serde_json::from_str::<Value>(text[inner.0..inner.1].trim()) else {
+        return plain();
+    };
+    let stripped = format!("{}{}", &text[..start], &text[end..]).trim().to_string();
+    let followups = data
+        .get("followups")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).take(4).map(str::to_string).collect())
+        .unwrap_or_default();
+    let has_sources = data.get("sources").and_then(Value::as_array).is_some_and(|list| !list.is_empty());
+    NoraBlock { sources_only: has_sources && stripped.is_empty(), text: stripped, followups }
+}
+
+/// `( start of the block, (start, end) of its JSON, end of the block )` for a ```` ```nora ```` fence.
+fn find_fence(lower: &str) -> Option<(usize, (usize, usize), usize)> {
+    let start = lower.find("```nora")?;
+    let after = start + "```nora".len();
+    let inner_start = after + (lower[after..].len() - lower[after..].trim_start().len());
+    let close = lower[inner_start..].find("```")? + inner_start;
+    Some((start, (inner_start, close), close + 3))
+}
+
+/// The same for a `<!-- nora: … -->` comment.
+fn find_comment(lower: &str) -> Option<(usize, (usize, usize), usize)> {
+    for (start, _) in lower.match_indices("<!--") {
+        let after = start + 4;
+        let inner = lower[after..].trim_start();
+        let Some(rest) = inner.strip_prefix("nora:") else { continue };
+        let inner_start = lower.len() - rest.len();
+        let Some(close) = lower[inner_start..].find("-->") else { continue };
+        return Some((start, (inner_start, inner_start + close), inner_start + close + 3));
+    }
+    None
 }
 
 /// The conversation id in the answer of `start_or_resume_thread`.
@@ -271,7 +372,7 @@ mod tests {
         let message = json!({"messages": [{"role": "assistant", "author": "assistant", "content": "Bonjour", "text": "Bonjour !"}, {"role": "assistant", "content": "Seulement le contenu"}, {"role": "tool"}], "cards": [{"id": 1}]});
         let (replies, cards) = parse_messages(&message);
         assert_eq!(replies.len(), 3);
-        assert_eq!(replies[0].text, "Bonjour !");
+        assert_eq!(replies[0].text, "Bonjour", "content first, as the desk's chat reads it");
         assert_eq!(replies[1].text, "Seulement le contenu");
         assert_eq!((replies[2].role, replies[2].text.as_str()), (Role::Other, ""));
         assert_eq!(cards.len(), 1);
@@ -340,5 +441,42 @@ mod tests {
         let summary = DocActionKind::TypeText { text: long, paragraphs: false }.summary();
         assert!(summary.ends_with("…\"") || summary.contains('…'));
         assert_eq!(DocActionKind::Execute { command: "format.bold".into(), params: json!({}) }.summary(), "Run `format.bold`");
+    }
+
+    #[test]
+    fn a_machine_block_is_taken_out_of_the_text_and_gives_followups() {
+        let fenced = json!({"role": "assistant", "text": "Voici le total.\n```nora\n{\"card\": {\"type\": \"kpi\"}, \"followups\": [\"a\", \"b\", \"c\", \"d\", \"e\"]}\n```"});
+        let message = ChatMessage::from_json(&fenced);
+        assert_eq!(message.text, "Voici le total.");
+        assert_eq!(message.followups, vec!["a", "b", "c", "d"], "four at most");
+        assert!(!message.sources_only);
+        let commented = ChatMessage::from_json(&json!({"role": "assistant", "text": "Fait. <!-- NORA: {\"followups\": [\"Et après ?\"]} -->"}));
+        assert_eq!(commented.text, "Fait.");
+        assert_eq!(commented.followups, vec!["Et après ?"]);
+        // Not valid JSON: left in the text, as on the desk.
+        let broken = ChatMessage::from_json(&json!({"role": "assistant", "text": "Oui ```nora {oops} ```"}));
+        assert_eq!(broken.text, "Oui ```nora {oops} ```");
+        // Manual pages and nothing else.
+        let sources = ChatMessage::from_json(&json!({"role": "assistant", "text": "```nora {\"sources\": [{\"title\": \"Aide\"}]} ```"}));
+        assert!(sources.sources_only && sources.text.is_empty());
+    }
+
+    #[test]
+    fn a_reply_may_be_a_list_of_parts_or_carry_its_text_under_another_key() {
+        let parts = ChatMessage::from_json(&json!({"role": "assistant", "content": [{"text": "un"}, {"content": "deux"}, {"x": 1}]}));
+        assert_eq!(parts.text, "un\ndeux");
+        assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "body": "corps"})).text, "corps");
+        assert_eq!(ChatMessage::from_json(&json!({"role": "assistant", "content": "", "text": "repli"})).text, "repli");
+        assert_eq!(ChatMessage::from_json(&json!({})).text, "");
+    }
+
+    #[test]
+    fn the_ack_anchors_are_lowercase_and_narrow() {
+        for anchor in ACK_ANCHORS {
+            assert_eq!(*anchor, anchor.to_lowercase());
+        }
+        // A real answer that merely mentions the current month is not an ack.
+        let answer = "Le chiffre d'affaires du mois en cours est de 517 CHF.".to_lowercase();
+        assert!(!ACK_ANCHORS.iter().any(|anchor| answer.contains(anchor)));
     }
 }
