@@ -152,6 +152,9 @@ impl Colors {
 pub struct NoraPanel {
     pub labels: NoraLabels,
     pub style: NoraStyle,
+    /// Set when the host has no way to reach Nora: the panel then says why instead of offering a
+    /// text box that would swallow the message.
+    pub offline: Option<String>,
     draft: String,
     focus_input: bool,
     scroll_to_end: bool,
@@ -298,6 +301,11 @@ impl NoraPanel {
     }
 
     fn input_row(&mut self, ui: &mut Ui, input_id: Id, actions: &mut Vec<PanelAction>) {
+        if let Some(reason) = self.offline.as_deref() {
+            self.focus_input = false;
+            ui.add(Label::new(RichText::new(reason).weak()).wrap());
+            return;
+        }
         if std::mem::take(&mut self.focus_input) {
             ui.memory_mut(|memory| memory.request_focus(input_id));
         }
@@ -482,6 +490,17 @@ mod tests {
         h.get_by_label("Send").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::Send("Translate this".into())]);
+    }
+
+    #[test]
+    fn an_offline_panel_says_why_and_offers_no_text_box() {
+        let mut h = harness(session());
+        h.state_mut().panel.offline = Some("Nora isn't available here".into());
+        h.run();
+        assert!(h.query_by_label("Nora isn't available here").is_some());
+        assert!(h.query_by_role(egui::accesskit::Role::MultilineTextInput).is_none());
+        assert!(h.query_by_label("Send").is_none());
+        assert!(h.state().actions.is_empty());
     }
 
     #[test]

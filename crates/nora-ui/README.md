@@ -34,6 +34,7 @@ waiting for something, so an event-driven host keeps polling Nora without a time
 - A card with **Allow** and **Refuse** when Nora asks to do something that needs a yes (saving, a
   command the policy flags).
 - **Undo** for Nora's last change and **New conversation**.
+- When the host has no way to reach Nora, `NoraPanel::offline` says why in place of the text box.
 
 ## For the app
 
