@@ -368,6 +368,43 @@ fn a_change_can_be_undone_once() {
     assert!(nora.handle(Input::UndoLast).is_empty());
 }
 
+/// An action the editor reports as having changed nothing (a command that only reads) leaves nothing to undo: the
+/// Undo button would otherwise stay on for a change that is not there.
+#[test]
+fn an_action_that_changed_nothing_leaves_nothing_to_undo() {
+    let mut nora = started();
+    let outputs = poll(&mut nora, 100, json!([]), json!([{"action": "doc_execute", "command": "sheet.read", "params": {}, "callback_id": "c4"}]));
+    let call = documents(&outputs)[0].clone();
+    nora.handle(Input::DocumentResult { id: call.id, result: Ok(json!({"changed": false, "values": [[1]]})) });
+    assert!(!nora.can_undo());
+}
+
+/// An Undo the editor refuses (the person changed the document after Nora) leaves nothing more to undo: Nora's earlier
+/// changes lie under the person's edit too, and each click would only be refused again.
+#[test]
+fn an_undo_the_editor_refuses_leaves_nothing_more_to_undo() {
+    let mut nora = started();
+    let outputs = poll(
+        &mut nora,
+        100,
+        json!([]),
+        json!([
+            {"action": "doc_execute", "command": "format.bold", "params": {}, "callback_id": "c5"},
+            {"action": "doc_execute", "command": "format.italic", "params": {}, "callback_id": "c6"}
+        ]),
+    );
+    let mut pending: Vec<DocumentCall> = documents(&outputs).into_iter().cloned().collect();
+    while let Some(call) = pending.pop() {
+        let next = nora.handle(Input::DocumentResult { id: call.id, result: Ok(json!({})) });
+        pending.extend(documents(&next).into_iter().cloned());
+    }
+    assert!(nora.can_undo());
+    let undone = nora.handle(Input::UndoLast);
+    let undo = documents(&undone)[0].clone();
+    nora.handle(Input::DocumentResult { id: undo.id, result: Err("the document changed since".into()) });
+    assert!(!nora.can_undo(), "Nora's earlier change lies under the person's edit as well");
+}
+
 #[test]
 fn a_failed_action_is_reported_to_nora_and_to_the_user() {
     let mut nora = started();

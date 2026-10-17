@@ -64,7 +64,8 @@ pub enum Input {
     Tick { now_ms: u64 },
     /// The answer to an [`Output::Http`].
     Http(HttpResponse),
-    /// The result of an [`Output::Document`] the editor ran.
+    /// The result of an [`Output::Document`] the editor ran. An `Ok` object with `"changed": false` says the action
+    /// changed nothing (a command that only reads): it leaves nothing to undo.
     DocumentResult { id: u64, result: Result<Value, String> },
     /// The user clicked yes or no on a [`Confirmation`].
     Confirm { id: u64, accepted: bool },
@@ -126,6 +127,8 @@ struct Running {
     callback_id: Option<String>,
     modifies: bool,
     summary: String,
+    /// The user's Undo of Nora's last change.
+    undo: bool,
 }
 
 struct Waiting {
@@ -526,7 +529,8 @@ impl NoraSession {
 
     fn run_document(&mut self, action: DocAction, out: &mut Vec<Output>) {
         let id = self.new_id();
-        self.running.insert(id, Running { callback_id: action.callback_id, modifies: action.kind.modifies(), summary: action.kind.summary() });
+        let undo = action.kind == DocActionKind::Undo;
+        self.running.insert(id, Running { callback_id: action.callback_id, modifies: action.kind.modifies(), summary: action.kind.summary(), undo });
         self.last_activity_ms = self.now_ms;
         out.push(Output::Document(DocumentCall { id, kind: action.kind }));
     }
@@ -543,12 +547,17 @@ impl NoraSession {
         self.last_activity_ms = self.now_ms;
         let observation = match result {
             Ok(value) => {
-                if run.modifies {
+                if run.modifies && value.get("changed") != Some(&Value::Bool(false)) {
                     self.changes.push(run.summary);
                 }
                 observation_ok(value)
             }
             Err(message) => {
+                // An Undo the editor refuses (the person changed the document since): Nora's earlier changes lie
+                // under that edit too, and each click would only be refused again.
+                if run.undo {
+                    self.changes.clear();
+                }
                 self.last_error = Some(message.clone());
                 observation_error(&message)
             }
