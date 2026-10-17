@@ -47,6 +47,8 @@ pub enum PanelAction {
     Send(String),
     /// The user answered a confirmation Nora asked for.
     Confirm { id: u64, accepted: bool },
+    /// The user stopped Nora while it worked.
+    Stop,
     /// The user asked to undo Nora's last change.
     Undo,
     /// The user started a new conversation.
@@ -59,6 +61,7 @@ impl PanelAction {
         match self {
             PanelAction::Send(text) => Input::Send(text),
             PanelAction::Confirm { id, accepted } => Input::Confirm { id, accepted },
+            PanelAction::Stop => Input::Cancel,
             PanelAction::Undo => Input::UndoLast,
             PanelAction::NewConversation => Input::Reset,
         }
@@ -75,7 +78,11 @@ pub struct NoraLabels {
     pub undo_hint: String,
     pub placeholder: String,
     pub send: String,
+    /// In place of Send while Nora works.
+    pub stop: String,
     pub working: String,
+    /// Under the conversation once the user stopped Nora, until the next message.
+    pub stopped: String,
     /// Shown while the conversation is empty.
     pub empty: String,
     /// Above the description of an action Nora wants to run.
@@ -96,7 +103,9 @@ impl Default for NoraLabels {
             undo_hint: "Undo the last change Nora made to the document".into(),
             placeholder: "Ask Nora…".into(),
             send: "Send".into(),
+            stop: "Stop".into(),
             working: "Nora is working…".into(),
+            stopped: "Stopped.".into(),
             empty: "Ask Nora to write, rewrite, translate or format your document.".into(),
             confirm_heading: "Nora wants to:".into(),
             allow: "Allow".into(),
@@ -247,6 +256,9 @@ impl NoraPanel {
                     ui.weak(self.labels.working.as_str());
                 });
             }
+            if session.stopped() {
+                ui.weak(self.labels.stopped.as_str());
+            }
             if let Some(error) = session.last_error() {
                 ui.colored_label(colors.error, error);
             }
@@ -304,7 +316,7 @@ impl NoraPanel {
     }
 
     /// The text box and the Send button. While Nora works (`busy`) the message waits in the box, as in
-    /// the desk's chat, which locks its field until the answer is in.
+    /// the desk's chat, which locks its field until the answer is in, and the button stops Nora.
     fn input_row(&mut self, ui: &mut Ui, input_id: Id, busy: bool, actions: &mut Vec<PanelAction>) {
         if let Some(reason) = self.offline.as_deref() {
             self.focus_input = false;
@@ -319,8 +331,14 @@ impl NoraPanel {
         ui.horizontal(|ui| {
             // Right to left so that the button takes its own width and the text box the rest.
             ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-                let can_send = !busy && !self.draft.trim().is_empty();
-                send_clicked = ui.add_enabled(can_send, Button::new(self.labels.send.as_str())).clicked();
+                if busy {
+                    if ui.button(self.labels.stop.as_str()).clicked() {
+                        actions.push(PanelAction::Stop);
+                    }
+                } else {
+                    let can_send = !self.draft.trim().is_empty();
+                    send_clicked = ui.add_enabled(can_send, Button::new(self.labels.send.as_str())).clicked();
+                }
                 // Plain Enter is handled below: only Shift+Enter is a new line.
                 let output = TextEdit::multiline(&mut self.draft)
                     .id(input_id)
@@ -441,6 +459,7 @@ mod tests {
     fn actions_map_to_session_inputs() {
         assert!(matches!(PanelAction::Send("a".into()).into_input(), Input::Send(text) if text == "a"));
         assert!(matches!(PanelAction::Confirm { id: 3, accepted: false }.into_input(), Input::Confirm { id: 3, accepted: false }));
+        assert!(matches!(PanelAction::Stop.into_input(), Input::Cancel));
         assert!(matches!(PanelAction::Undo.into_input(), Input::UndoLast));
         assert!(matches!(PanelAction::NewConversation.into_input(), Input::Reset));
     }
@@ -520,7 +539,31 @@ mod tests {
         h.run_steps(3);
         assert!(h.state().actions.is_empty(), "Enter does not send while Nora works");
         assert_eq!(h.state().panel.draft(), "Second", "and the message is still there");
-        assert!(h.get_by_label("Send").accesskit_node().is_disabled());
+        assert!(h.query_by_label("Send").is_none(), "the button stops Nora instead");
+        assert!(h.query_by_label("Stop").is_some());
+    }
+
+    #[test]
+    fn stop_stops_nora_and_says_so_until_the_next_message() {
+        let mut nora = session();
+        nora.handle(Input::Send("Hello".into()));
+        let mut h = harness(nora);
+        h.run_steps(2);
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+        assert_eq!(h.state().actions, vec![PanelAction::Stop]);
+
+        let state = h.state_mut();
+        let stop = state.actions.remove(0).into_input();
+        state.session.handle(stop);
+        state.panel.set_draft("Something else");
+        h.run_steps(2);
+        assert!(h.query_by_label("Stopped.").is_some());
+        assert!(h.query_by_label("Nora is working…").is_none());
+        assert!(!h.get_by_label("Send").accesskit_node().is_disabled(), "the next message can go");
+        h.state_mut().session.handle(Input::Send("Something else".into()));
+        h.run_steps(2);
+        assert!(h.query_by_label("Stopped.").is_none());
     }
 
     #[test]

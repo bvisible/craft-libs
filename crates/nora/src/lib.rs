@@ -25,6 +25,10 @@
 //! `nora.api.chat.*` methods (`start_or_resume_thread`, `post_message`, `get_messages`,
 //! `get_browser_actions`) and `nora.api.page_observation.receive_observation`. An editor is one
 //! canvas, so Nora asks for it through its own family of actions, `doc_*` ([`DocActionKind`]).
+//!
+//! With the `ai-core` feature, the errors and the turns also speak the vocabulary of
+//! `craft-ai-core` (`NoraError::kind`, `NoraSession::turn_state`), so that a host shows Nora with its
+//! other AI connections.
 
 pub mod context;
 pub mod error;

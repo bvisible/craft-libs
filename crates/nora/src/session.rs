@@ -10,8 +10,11 @@ use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
     self, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, observation_body, observation_error, observation_ok, parse_actions,
-    parse_messages, post_message_body, sent_at_of, start_thread_body, thread_body, thread_id_of,
+    parse_messages, post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of,
 };
+
+/// What Nora is told about an action that will not run because the user stopped it.
+const STOPPED: &str = "the user stopped Nora";
 
 /// How a session behaves. The defaults suit an editor talking to a Neoffice instance.
 #[derive(Debug, Clone)]
@@ -65,6 +68,9 @@ pub enum Input {
     DocumentResult { id: u64, result: Result<Value, String> },
     /// The user clicked yes or no on a [`Confirmation`].
     Confirm { id: u64, accepted: bool },
+    /// The user stopped Nora (the Stop button). Nothing to stop does nothing; see
+    /// [`NoraSession::stopped`].
+    Cancel,
     /// The user clicked Undo.
     UndoLast,
     /// The user started a new conversation.
@@ -103,7 +109,17 @@ enum Pending {
     Send,
     Messages,
     Actions,
+    /// A read of the action queue made before the user stopped: what it took out of the queue is
+    /// refused, not run.
+    StoppedActions,
     Observation,
+}
+
+/// How the last message's turn ended.
+enum TurnEnd {
+    Answered,
+    Failed(NoraError),
+    Stopped,
 }
 
 struct Running {
@@ -142,6 +158,12 @@ pub struct NoraSession {
     running: HashMap<u64, Running>,
     waiting: Vec<Waiting>,
     changes: Vec<String>,
+    /// How the last turn ended: `None` while it runs and before the first message.
+    outcome: Option<TurnEnd>,
+    /// Set by a Stop until the conversation is reset. The chat has no stop on the server: Nora's agent
+    /// may go on with the stopped message and queue actions for it, in the queue the next messages
+    /// read. A queue stamped before the current message holds that work only, and is refused.
+    refuse_older_actions: bool,
 }
 
 impl NoraSession {
@@ -166,6 +188,8 @@ impl NoraSession {
             running: HashMap::new(),
             waiting: Vec::new(),
             changes: Vec::new(),
+            outcome: None,
+            refuse_older_actions: false,
         }
     }
 
@@ -179,6 +203,7 @@ impl NoraSession {
             Input::Http(response) => self.on_http(response, &mut out),
             Input::DocumentResult { id, result } => self.on_document_result(id, result, &mut out),
             Input::Confirm { id, accepted } => self.on_confirm(id, accepted, &mut out),
+            Input::Cancel => self.on_cancel(&mut out),
             Input::UndoLast => self.on_undo(&mut out),
             Input::Reset => self.on_reset(&mut out),
         }
@@ -198,6 +223,20 @@ impl NoraSession {
     /// The last failure, to show in the panel. A successful read clears it.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Whether the user stopped the last message. The next message clears it.
+    pub fn stopped(&self) -> bool {
+        matches!(self.outcome, Some(TurnEnd::Stopped))
+    }
+
+    /// Why the last message failed, when it did: a host checks [`NoraError::is_auth`] to offer to
+    /// sign in again. The next message clears it.
+    pub fn failure(&self) -> Option<&NoraError> {
+        match &self.outcome {
+            Some(TurnEnd::Failed(error)) => Some(error),
+            _ => None,
+        }
     }
 
     /// The conversation id, once Nora has given one.
@@ -243,6 +282,7 @@ impl NoraSession {
         }
         self.transcript.push(ChatMessage::user(text.clone()));
         self.busy = true;
+        self.outcome = None;
         self.last_error = None;
         self.last_activity_ms = self.now_ms;
         self.turn_started_ms = self.now_ms;
@@ -261,7 +301,8 @@ impl NoraSession {
             return;
         }
         let nothing_running = self.running.is_empty() && self.waiting.is_empty();
-        let nothing_pending = nothing_running && self.inflight.values().all(|pending| matches!(pending, Pending::Observation));
+        let nothing_pending =
+            nothing_running && self.inflight.values().all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions));
         // Done first, so that a finished turn ends without one more poll. The final reply is in and the
         // actions queued with it have had their moment...
         let settled = self.final_seen_ms.is_some_and(|seen| now_ms.saturating_sub(seen) >= self.cfg.settle_ms);
@@ -299,6 +340,7 @@ impl NoraSession {
     fn finish(&mut self, out: &mut Vec<Output>) {
         self.busy = false;
         self.next_poll_ms = None;
+        self.outcome = Some(TurnEnd::Answered);
         out.push(Output::Changed);
     }
 
@@ -328,24 +370,74 @@ impl NoraSession {
             }
             (Pending::Actions, Ok(message)) => {
                 self.last_error = None;
+                let stale = self.refuse_older_actions && queued_at_of(&message).zip(self.sent_at).is_some_and(|(queued, sent)| queued < sent);
                 for action in parse_actions(&message) {
-                    self.last_activity_ms = self.now_ms;
-                    self.handle_action(action, out);
+                    if stale {
+                        self.refuse(action, STOPPED, out);
+                    } else {
+                        self.last_activity_ms = self.now_ms;
+                        self.handle_action(action, out);
+                    }
+                }
+            }
+            (Pending::StoppedActions, Ok(message)) => {
+                for action in parse_actions(&message) {
+                    self.refuse(action, STOPPED, out);
                 }
             }
             (Pending::Messages | Pending::Actions, Err(error)) => {
                 self.last_error = Some(error.to_string());
                 out.push(Output::Changed);
             }
-            (Pending::Observation, _) => {}
+            (Pending::StoppedActions | Pending::Observation, _) => {}
         }
     }
 
     fn fail(&mut self, error: NoraError, out: &mut Vec<Output>) {
         self.last_error = Some(error.to_string());
+        self.outcome = Some(TurnEnd::Failed(error));
         self.busy = false;
         self.next_poll_ms = None;
         out.push(Output::Changed);
+    }
+
+    /// Stops the turn at once. Nora's text chat has no stop on the server and the agent may still
+    /// answer, so the session stops reading, refuses what waits for the user and whatever the turn
+    /// still sends (see `refuse_older_actions`), and lets the editor finish what it already runs:
+    /// that result goes to Nora as it is, and can be undone. A first message whose thread the server
+    /// has not named yet leaves it behind; the next message opens another one.
+    fn on_cancel(&mut self, out: &mut Vec<Output>) {
+        if !self.busy {
+            return;
+        }
+        self.busy = false;
+        self.next_poll_ms = None;
+        self.final_seen_ms = None;
+        self.outcome = Some(TurnEnd::Stopped);
+        self.refuse_older_actions = true;
+        self.inflight.retain(|_, pending| !matches!(pending, Pending::Send | Pending::Messages));
+        for pending in self.inflight.values_mut() {
+            if matches!(pending, Pending::Actions) {
+                *pending = Pending::StoppedActions;
+            }
+        }
+        for waiting in std::mem::take(&mut self.waiting) {
+            if let Some(callback) = waiting.action.callback_id {
+                self.answer_error(&callback, STOPPED, out);
+            }
+        }
+        out.push(Output::Changed);
+    }
+
+    /// Answers the action Nora waits on, if it waits, without running it.
+    fn refuse(&mut self, action: RemoteAction, why: &str, out: &mut Vec<Output>) {
+        let callback = match action {
+            RemoteAction::Doc(doc) => doc.callback_id,
+            RemoteAction::Unsupported { callback_id, .. } => callback_id,
+        };
+        if let Some(callback) = callback {
+            self.answer_error(&callback, why, out);
+        }
     }
 
     /// Adds the replies the transcript has not seen. The server list holds Nora's replies only, in the
@@ -503,7 +595,30 @@ impl NoraSession {
         self.running.clear();
         self.waiting.clear();
         self.changes.clear();
+        self.outcome = None;
+        self.refuse_older_actions = false;
         out.push(Output::Changed);
+    }
+}
+
+/// The session in the shared job vocabulary of `craft-ai-core`.
+#[cfg(feature = "ai-core")]
+impl NoraSession {
+    /// The last message's turn as a `craft-ai-core` job, for a host that shows Nora with its other AI
+    /// jobs: `None` before the first message, `Queued` until the server has the message, `Running`
+    /// while Nora works or waits for the user, then `Succeeded`, `Failed` or `Cancelled` (the Stop
+    /// button).
+    pub fn turn_state(&self) -> Option<craft_ai_core::JobState> {
+        use craft_ai_core::JobState;
+        if self.busy {
+            let sending = self.inflight.values().any(|pending| matches!(pending, Pending::Send));
+            return Some(if sending { JobState::Queued } else { JobState::Running { percent: None } });
+        }
+        self.outcome.as_ref().map(|end| match end {
+            TurnEnd::Answered => JobState::Succeeded,
+            TurnEnd::Failed(error) => JobState::Failed { error: error.to_ai_error() },
+            TurnEnd::Stopped => JobState::Cancelled,
+        })
     }
 }
 

@@ -208,6 +208,11 @@ pub fn sent_at_of(message: &Value) -> Option<f64> {
     message.get("sent_at").and_then(Value::as_f64)
 }
 
+/// The server time at which the action queue of `get_browser_actions` was last filled.
+pub fn queued_at_of(message: &Value) -> Option<f64> {
+    message.get("timestamp").and_then(Value::as_f64)
+}
+
 /// The conversation id of any answer that carries one (`post_message` may change it).
 pub fn thread_id_of(message: &Value) -> Option<String> {
     message.get("thread_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)

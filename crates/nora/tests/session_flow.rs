@@ -1,7 +1,7 @@
 // //// Neoffice — added file (no upstream equivalent): end-to-end tests of the Nora conversation state machine.
 
 use craft_nora::{
-    AppKind, CommandPolicy, DocActionKind, DocumentCall, DocumentInfo, HttpRequest, HttpResponse, Input, NoraSession, Output, PageContext,
+    AppKind, CommandPolicy, DocActionKind, DocumentCall, DocumentInfo, HttpRequest, HttpResponse, Input, NoraError, NoraSession, Output, PageContext,
     SessionConfig, protocol,
 };
 use serde_json::{Value, json};
@@ -56,6 +56,24 @@ fn poll(nora: &mut NoraSession, now: u64, replies: Value, actions: Value) -> Vec
     let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
     nora.handle(ok(&messages, json!({"success": true, "messages": replies, "cards": []})));
     nora.handle(ok(&queue, json!({"success": true, "actions": actions})))
+}
+
+/// Like [`poll`], with the action queue answered as `queue` (its `actions` and its `timestamp`).
+fn poll_queue(nora: &mut NoraSession, now: u64, queue: Value) -> Vec<Output> {
+    let outputs = nora.handle(Input::Tick { now_ms: now });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let actions = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    nora.handle(ok(&messages, json!({"success": true, "messages": [], "cards": []})));
+    nora.handle(ok(&actions, queue))
+}
+
+/// The error Nora was told for the observation of `callback`, among `outputs`.
+fn refusal_of<'a>(outputs: &'a [Output], callback: &str) -> &'a Value {
+    let observation = requests(outputs)
+        .into_iter()
+        .find(|r| r.path == protocol::RECEIVE_OBSERVATION && r.body["callback_id"] == callback)
+        .unwrap_or_else(|| panic!("no observation for {callback} in {outputs:?}"));
+    &observation.body["observation"]["error"]
 }
 
 #[test]
@@ -155,6 +173,7 @@ fn silence_ends_the_wait_with_an_error_after_eight_minutes() {
     let outputs = nora.handle(Input::Tick { now_ms: 480_100 });
     assert!(!nora.is_busy());
     assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
+    assert_eq!(nora.failure(), Some(&NoraError::Timeout));
     assert!(outputs.contains(&Output::Changed));
 }
 
@@ -305,6 +324,10 @@ fn a_server_refusal_is_shown_and_ends_the_turn() {
     nora.handle(Input::Http(HttpResponse { id: start.id, status: 403, body }));
     assert_eq!(nora.last_error(), Some("Not permitted"));
     assert!(!nora.is_busy());
+    // The host can tell a refused session from other failures, to offer to sign in again.
+    assert!(nora.failure().is_some_and(NoraError::is_auth));
+    nora.handle(Input::Send("Encore".into()));
+    assert!(nora.failure().is_none());
 }
 
 #[test]
@@ -445,4 +468,200 @@ fn stale_answers_are_ignored() {
     let stale = Input::Http(HttpResponse { id: 424_242, status: 200, body: json!({"message": {}}).to_string() });
     assert!(nora.handle(stale).is_empty());
     assert!(nora.handle(Input::DocumentResult { id: 424_242, result: Ok(json!(1)) }).is_empty());
+}
+
+#[test]
+fn stop_ends_the_turn_at_once_and_nothing_more_is_read() {
+    let mut nora = started();
+    let polls = nora.handle(Input::Tick { now_ms: 100 });
+    let messages = request_to(&polls, protocol::GET_MESSAGES).clone();
+    let stopped = nora.handle(Input::Cancel);
+    assert!(stopped.contains(&Output::Changed));
+    assert!(!nora.is_busy() && nora.stopped() && nora.failure().is_none());
+    assert_eq!(nora.next_wake_ms(), None);
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 5_000 })).is_empty());
+    // The reply that was on its way is not shown.
+    nora.handle(ok(&messages, json!({"success": true, "messages": [{"role": "assistant", "text": "Trop tard"}], "cards": []})));
+    assert_eq!(nora.transcript().len(), 1);
+    // Stopping again does nothing; the next message clears it.
+    assert!(nora.handle(Input::Cancel).is_empty());
+    let sent = nora.handle(Input::Send("Autre chose".into()));
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    assert!(nora.is_busy() && !nora.stopped());
+    // The read of the queue made before the stop never got its answer: it does not hold this turn.
+    nora.handle(ok(&post, json!({"thread_id": "t1"})));
+    poll(&mut nora, 6_000, json!([{"role": "assistant", "text": "Voici."}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 8_000 });
+    assert!(!nora.is_busy());
+}
+
+#[test]
+fn nothing_to_stop_does_nothing() {
+    let mut nora = session();
+    assert!(nora.handle(Input::Cancel).is_empty());
+    assert!(!nora.stopped());
+}
+
+#[test]
+fn a_first_message_stopped_before_the_server_named_its_thread_leaves_it_behind() {
+    let mut nora = session();
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    let start = request_to(&sent, protocol::START_OR_RESUME_THREAD).clone();
+    nora.handle(Input::Cancel);
+    nora.handle(ok(&start, json!({"thread_id": "t1"})));
+    assert_eq!(nora.thread_id(), None);
+    assert!(!nora.is_busy());
+    let next = nora.handle(Input::Send("Autre chose".into()));
+    request_to(&next, protocol::START_OR_RESUME_THREAD);
+}
+
+#[test]
+fn stop_refuses_what_waits_for_the_user() {
+    let mut nora = started();
+    poll(&mut nora, 100, json!([]), json!([{"action": "doc_save", "callback_id": "c7"}, {"action": "doc_save", "callback_id": "c8"}]));
+    assert_eq!(nora.confirmations().len(), 2);
+    let stopped = nora.handle(Input::Cancel);
+    assert!(nora.confirmations().is_empty());
+    assert!(documents(&stopped).is_empty());
+    assert_eq!(refusal_of(&stopped, "c7"), "the user stopped Nora");
+    assert_eq!(refusal_of(&stopped, "c8"), "the user stopped Nora");
+}
+
+#[test]
+fn stop_lets_the_running_action_finish_and_report_its_real_result() {
+    let mut nora = started();
+    let outputs = poll(&mut nora, 100, json!([]), json!([{"action": "doc_execute", "command": "format.bold", "params": {}, "callback_id": "c2"}]));
+    let call = documents(&outputs)[0].clone();
+    let stopped = nora.handle(Input::Cancel);
+    assert!(requests(&stopped).is_empty(), "nothing is said about it yet: the editor is running it");
+    let done = nora.handle(Input::DocumentResult { id: call.id, result: Ok(json!({})) });
+    let observation = request_to(&done, protocol::RECEIVE_OBSERVATION);
+    assert_eq!(observation.body["callback_id"], "c2");
+    assert_eq!(observation.body["observation"]["ok"], true);
+    assert!(nora.can_undo(), "what Nora did before the stop can be undone");
+}
+
+#[test]
+fn what_the_stopped_message_still_queues_is_refused_not_run() {
+    let mut nora = started_at(1_000.0);
+    let polls = nora.handle(Input::Tick { now_ms: 100 });
+    let queue = request_to(&polls, protocol::GET_ACTIONS).clone();
+    nora.handle(Input::Cancel);
+    // The read on its way took these actions out of the queue: Nora is told, the editor runs nothing.
+    let late = nora.handle(ok(
+        &queue,
+        json!({"success": true, "actions": [{"action": "doc_type_text", "text": "x", "callback_id": "c1"}], "timestamp": 1_001.0}),
+    ));
+    assert!(documents(&late).is_empty());
+    assert_eq!(refusal_of(&late, "c1"), "the user stopped Nora");
+    // The next message: a queue filled before it is the stopped work, one filled after it is its own.
+    let sent = nora.handle(Input::Send("Autre chose".into()));
+    nora.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1", "sent_at": 2_000.0})));
+    let older = poll_queue(
+        &mut nora,
+        2_100,
+        json!({"success": true, "actions": [{"action": "doc_type_text", "text": "y", "callback_id": "c2"}], "timestamp": 1_500.0}),
+    );
+    assert!(documents(&older).is_empty());
+    assert_eq!(refusal_of(&older, "c2"), "the user stopped Nora");
+    let own =
+        poll_queue(&mut nora, 2_600, json!({"success": true, "actions": [{"action": "doc_observe", "callback_id": "c3"}], "timestamp": 2_000.5}));
+    assert_eq!(documents(&own).len(), 1);
+}
+
+#[test]
+fn without_a_stop_an_older_queue_still_runs() {
+    // Only a Stop makes an older queue suspect; a new conversation forgets it.
+    let mut nora = started_at(1_000.0);
+    let outputs =
+        poll_queue(&mut nora, 100, json!({"success": true, "actions": [{"action": "doc_observe", "callback_id": "c1"}], "timestamp": 900.0}));
+    assert_eq!(documents(&outputs).len(), 1);
+    nora.handle(Input::Cancel);
+    nora.handle(Input::Reset);
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    nora.handle(ok(request_to(&sent, protocol::START_OR_RESUME_THREAD), json!({"thread_id": "t2", "sent_at": 3_000.0})));
+    let outputs =
+        poll_queue(&mut nora, 200, json!({"success": true, "actions": [{"action": "doc_observe", "callback_id": "c2"}], "timestamp": 2_900.0}));
+    assert_eq!(documents(&outputs).len(), 1);
+}
+
+/// The turns and the failures in the vocabulary of `craft-ai-core`.
+#[cfg(feature = "ai-core")]
+mod ai_core {
+    use super::*;
+    use craft_ai_core::{ErrorKind, JobState};
+
+    #[test]
+    fn failures_have_the_shared_kinds() {
+        let server = |status: u16| NoraError::Server { status, message: "refused".into() };
+        let cases = [
+            (NoraError::Http(401), ErrorKind::Auth),
+            (server(403), ErrorKind::Auth),
+            (NoraError::Http(429), ErrorKind::RateLimited),
+            (NoraError::Http(502), ErrorKind::Network),
+            (server(503), ErrorKind::Network),
+            (NoraError::Http(504), ErrorKind::Network),
+            (NoraError::Unreachable("No answer from Nora".into()), ErrorKind::Network),
+            (server(417), ErrorKind::InvalidRequest),
+            (NoraError::Http(404), ErrorKind::InvalidRequest),
+            (NoraError::Http(500), ErrorKind::Provider),
+            (NoraError::Malformed("no `message`".into()), ErrorKind::Provider),
+            (NoraError::Timeout, ErrorKind::Provider),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind, "{error:?}");
+            let shared = error.to_ai_error();
+            assert_eq!((shared.kind, shared.message), (kind, error.to_string()));
+        }
+        assert!(NoraError::Unreachable("down".into()).to_ai_error().is_retryable());
+        assert!(!NoraError::Timeout.to_ai_error().is_retryable());
+    }
+
+    /// Records the state after each step and checks that every change is one `craft-ai-core` allows.
+    fn lifecycle(nora: &NoraSession, seen: &mut Vec<JobState>) {
+        if let Some(state) = nora.turn_state() {
+            if let Some(last) = seen.last() {
+                assert!(last.can_become(&state), "{last:?} cannot become {state:?}");
+            }
+            if seen.last() != Some(&state) {
+                seen.push(state);
+            }
+        }
+    }
+
+    #[test]
+    fn an_answered_turn_is_queued_then_running_then_succeeded() {
+        let mut nora = session();
+        assert_eq!(nora.turn_state(), None);
+        let mut seen = Vec::new();
+        let sent = nora.handle(Input::Send("Bonjour".into()));
+        lifecycle(&nora, &mut seen);
+        nora.handle(ok(request_to(&sent, protocol::START_OR_RESUME_THREAD), json!({"thread_id": "t1"})));
+        lifecycle(&nora, &mut seen);
+        poll(&mut nora, 100, json!([{"role": "assistant", "text": "Voici."}]), json!([]));
+        lifecycle(&nora, &mut seen);
+        nora.handle(Input::Tick { now_ms: 2_000 });
+        lifecycle(&nora, &mut seen);
+        assert_eq!(seen, vec![JobState::Queued, JobState::Running { percent: None }, JobState::Succeeded]);
+        nora.handle(Input::Reset);
+        assert_eq!(nora.turn_state(), None);
+    }
+
+    #[test]
+    fn a_stopped_turn_is_cancelled_and_a_refused_one_failed_with_its_kind() {
+        let mut nora = started();
+        let mut seen = vec![nora.turn_state().unwrap_or(JobState::Queued)];
+        nora.handle(Input::Cancel);
+        lifecycle(&nora, &mut seen);
+        assert_eq!(nora.turn_state(), Some(JobState::Cancelled));
+
+        let mut nora = session();
+        let sent = nora.handle(Input::Send("Bonjour".into()));
+        let start = request_to(&sent, protocol::START_OR_RESUME_THREAD).clone();
+        nora.handle(Input::Http(HttpResponse { id: start.id, status: 401, body: String::new() }));
+        match nora.turn_state() {
+            Some(JobState::Failed { error }) => assert_eq!(error.kind, ErrorKind::Auth),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
 }

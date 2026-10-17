@@ -3,13 +3,14 @@
 # only cover its own crates, so this runs the same checks on ours, crate by crate as upstream's do:
 # format, clippy without warnings, tests, and a wasm build (the Nora client core is meant to run in
 # the browser too). `cargo clippy --workspace` is deliberately not used: it fails on upstream code
-# that this fork does not touch.
+# that this fork does not touch. Each check also runs with the crates' features on (craft-nora's
+# `ai-core` speaks upstream's craft-ai-core), so a change of that crate shows here.
 name: Neoffice Nora crates
 
 on:
   push:
     branches: [version-15]
-    paths: ["crates/nora/**", "crates/nora-ui/**", "Cargo.toml", "Cargo.lock", ".github/workflows/neoffice-nora.yml"]
+    paths: ["crates/nora/**", "crates/nora-ui/**", "crates/ai-core/**", "Cargo.toml", "Cargo.lock", ".github/workflows/neoffice-nora.yml"]
   workflow_dispatch:
 
 permissions:
@@ -42,7 +43,9 @@ jobs:
           key: neoffice-nora
       - run: cargo fmt --check
       - run: cargo clippy -p craft-nora -p craft-nora-ui --all-targets --locked -- -D warnings
+      - run: cargo clippy -p craft-nora -p craft-nora-ui --all-targets --all-features --locked -- -D warnings
       - run: cargo test -p craft-nora -p craft-nora-ui --locked
+      - run: cargo test -p craft-nora -p craft-nora-ui --all-features --locked
   wasm:
     name: Nora WASM
     runs-on: ubuntu-latest
@@ -56,3 +59,4 @@ jobs:
         with:
           key: neoffice-nora-wasm
       - run: cargo check -p craft-nora -p craft-nora-ui --locked --target wasm32-unknown-unknown
+      - run: cargo check -p craft-nora -p craft-nora-ui --all-features --locked --target wasm32-unknown-unknown
