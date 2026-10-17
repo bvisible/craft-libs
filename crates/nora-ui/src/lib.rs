@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraSession, Output, Role};
+use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraError, NoraSession, Output, Role};
 use egui::{
     Align, Button, CentralPanel, Color32, Context, CornerRadius, Event, Frame, Id, Key, KeyboardShortcut, Label, Layout, Margin, Modifiers, Panel,
     RichText, ScrollArea, Stroke, TextEdit, Ui, Visuals,
@@ -170,11 +170,20 @@ pub struct NoraPanel {
     scroll_to_end: bool,
     /// Where the transcript's end was when it was last drawn.
     end_offset: f32,
+    /// The host's words for a failure of the connection to Nora; English (the error's own sentence) without them.
+    error_words: Option<fn(&NoraError) -> String>,
 }
 
 impl NoraPanel {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A panel that says a failure of the connection to Nora (no answer, a refusal of the server, a timeout) in the
+    /// app's language. The editor's own sentences (a refused action) are shown as they come.
+    pub fn with_error_words(mut self, words: fn(&NoraError) -> String) -> Self {
+        self.error_words = Some(words);
+        self
     }
 
     /// A panel with the app's own words.
@@ -270,7 +279,11 @@ impl NoraPanel {
                 ui.weak(self.labels.stopped.as_str());
             }
             if let Some(error) = session.last_error() {
-                ui.colored_label(colors.error, error);
+                let said = match (session.last_failure(), self.error_words) {
+                    (Some(failure), Some(words)) => words(failure),
+                    _ => error.to_string(),
+                };
+                ui.colored_label(colors.error, said);
             }
         });
         let end = (shown.content_size.y - shown.inner_rect.height()).max(0.0);
@@ -591,6 +604,39 @@ mod tests {
         h.get_by_label("Send").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::Send("Translate this".into())]);
+    }
+
+    /// A failure of the connection is said in the app's words when it gives them, in English otherwise.
+    #[test]
+    fn a_failure_is_said_in_the_app_s_words() {
+        let failed = || {
+            let mut nora = session();
+            nora.handle(Input::Send("Hello".into()));
+            nora.handle(Input::Tick { now_ms: 10 });
+            nora.handle(Input::Tick { now_ms: 500_000 });
+            assert!(nora.last_failure().is_some(), "nothing came: the wait ended");
+            nora
+        };
+        let mut english = harness(failed());
+        english.run();
+        assert!(english.query_by_label("Nora did not answer in time").is_some());
+        let mut french = Harness::builder().with_size(egui::vec2(360.0, 520.0)).build_ui_state(
+            |ui, state: &mut State| {
+                let actions = state.panel.show(ui, &state.session);
+                state.actions.extend(actions);
+            },
+            State {
+                panel: NoraPanel::new().with_error_words(|failure| match failure {
+                    NoraError::Timeout => "Nora n'a pas répondu à temps".into(),
+                    other => other.to_string(),
+                }),
+                session: failed(),
+                actions: Vec::new(),
+            },
+        );
+        french.run();
+        assert!(french.query_by_label("Nora n'a pas répondu à temps").is_some());
+        assert!(french.query_by_label("Nora did not answer in time").is_none());
     }
 
     #[test]

@@ -150,6 +150,8 @@ pub struct NoraSession {
     seen: HashSet<String>,
     busy: bool,
     last_error: Option<String>,
+    /// The failure behind `last_error`, when it is one between the editor and Nora (not the editor's own words).
+    last_failure: Option<NoraError>,
     now_ms: u64,
     last_activity_ms: u64,
     turn_started_ms: u64,
@@ -181,6 +183,7 @@ impl NoraSession {
             seen: HashSet::new(),
             busy: false,
             last_error: None,
+            last_failure: None,
             now_ms: 0,
             last_activity_ms: 0,
             turn_started_ms: 0,
@@ -226,6 +229,13 @@ impl NoraSession {
     /// The last failure, to show in the panel. A successful read clears it.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The failure behind [`Self::last_error`] when it came from the connection to Nora (no answer, a refusal of
+    /// the server, a timeout, an answer out of protocol), for a host that says it in its own words; `None` when the
+    /// error shown is the editor's own sentence (a refused action) or there is none.
+    pub fn last_failure(&self) -> Option<&NoraError> {
+        self.last_failure.as_ref()
     }
 
     /// Whether the user stopped the last message. The next message clears it.
@@ -287,6 +297,7 @@ impl NoraSession {
         self.busy = true;
         self.outcome = None;
         self.last_error = None;
+        self.last_failure = None;
         self.last_activity_ms = self.now_ms;
         self.turn_started_ms = self.now_ms;
         self.final_seen_ms = None;
@@ -369,10 +380,12 @@ impl NoraSession {
             (Pending::Send, Err(error)) => self.fail(error, out),
             (Pending::Messages, Ok(message)) => {
                 self.last_error = None;
+                self.last_failure = None;
                 self.absorb_replies(&message, out);
             }
             (Pending::Actions, Ok(message)) => {
                 self.last_error = None;
+                self.last_failure = None;
                 let stale = self.refuse_older_actions && queued_at_of(&message).zip(self.sent_at).is_some_and(|(queued, sent)| queued < sent);
                 for action in parse_actions(&message) {
                     if stale {
@@ -390,6 +403,7 @@ impl NoraSession {
             }
             (Pending::Messages | Pending::Actions, Err(error)) => {
                 self.last_error = Some(error.to_string());
+                self.last_failure = Some(error);
                 out.push(Output::Changed);
             }
             (Pending::StoppedActions | Pending::Observation, _) => {}
@@ -398,6 +412,7 @@ impl NoraSession {
 
     fn fail(&mut self, error: NoraError, out: &mut Vec<Output>) {
         self.last_error = Some(error.to_string());
+        self.last_failure = Some(error.clone());
         self.outcome = Some(TurnEnd::Failed(error));
         self.busy = false;
         self.next_poll_ms = None;
@@ -559,6 +574,7 @@ impl NoraSession {
                     self.changes.clear();
                 }
                 self.last_error = Some(message.clone());
+                self.last_failure = None;
                 observation_error(&message)
             }
         };
@@ -597,6 +613,7 @@ impl NoraSession {
         self.seen.clear();
         self.busy = false;
         self.last_error = None;
+        self.last_failure = None;
         self.turn_started_ms = 0;
         self.final_seen_ms = None;
         self.next_poll_ms = None;

@@ -174,7 +174,25 @@ fn silence_ends_the_wait_with_an_error_after_eight_minutes() {
     assert!(!nora.is_busy());
     assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
     assert_eq!(nora.failure(), Some(&NoraError::Timeout));
+    assert_eq!(nora.last_failure(), Some(&NoraError::Timeout), "for the host to say it in its own words");
     assert!(outputs.contains(&Output::Changed));
+}
+
+/// A failure while Nora is awaited keeps its kind for the host's words, and the next read that works clears it.
+#[test]
+fn a_failed_read_keeps_its_kind_for_the_host_s_words() {
+    let mut nora = started();
+    let outputs = nora.handle(Input::Tick { now_ms: 100 });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    nora.handle(Input::Http(HttpResponse { id: messages.id, status: 502, body: String::new() }));
+    assert_eq!(nora.last_failure(), Some(&NoraError::Http(502)));
+    assert_eq!(nora.last_error(), Some("the server answered HTTP 502"));
+    assert!(nora.is_busy(), "a failed read is not the end of the turn");
+    // The queue of that same round answered, the next round reads again.
+    nora.handle(Input::Http(HttpResponse { id: queue.id, status: 502, body: String::new() }));
+    poll(&mut nora, 10_000, json!([]), json!([]));
+    assert_eq!((nora.last_failure(), nora.last_error()), (None, None));
 }
 
 #[test]
@@ -413,6 +431,7 @@ fn a_failed_action_is_reported_to_nora_and_to_the_user() {
     let done = nora.handle(Input::DocumentResult { id: call.id, result: Err("no caret".into()) });
     assert_eq!(request_to(&done, protocol::RECEIVE_OBSERVATION).body["observation"], json!({"kind": "document", "ok": false, "error": "no caret"}));
     assert_eq!(nora.last_error(), Some("no caret"));
+    assert_eq!(nora.last_failure(), None, "the editor's own words, shown as they are");
     assert!(!nora.can_undo());
 }
 
