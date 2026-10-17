@@ -168,6 +168,8 @@ pub struct NoraPanel {
     draft: String,
     focus_input: bool,
     scroll_to_end: bool,
+    /// Where the transcript's end was when it was last drawn.
+    end_offset: f32,
 }
 
 impl NoraPanel {
@@ -237,7 +239,15 @@ impl NoraPanel {
     }
 
     fn transcript(&mut self, ui: &mut Ui, session: &NoraSession, colors: &Colors, actions: &mut Vec<PanelAction>) {
-        ScrollArea::vertical().id_salt("nora-transcript").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        let mut area = ScrollArea::vertical().id_salt("nora-transcript").auto_shrink([false, false]).stick_to_bottom(true);
+        // The user just sent something: show it, even when they had scrolled up. The view is put exactly at the end as
+        // it was last drawn, where egui counts it as stuck to the end, so that `stick_to_bottom` follows what comes
+        // next (the message being sent, Nora's replies). A scroll to the cursor would not do: it lands one item spacing
+        // past the end, which egui does not count as the end, and every reply after it stayed below the edge.
+        if self.scroll_to_end {
+            area = area.vertical_scroll_offset(self.end_offset);
+        }
+        let shown = area.show(ui, |ui| {
             if session.transcript().is_empty() && !session.is_busy() {
                 ui.add_space(ui.spacing().item_spacing.y * 4.0);
                 ui.vertical_centered(|ui| ui.weak(self.labels.empty.as_str()));
@@ -262,11 +272,11 @@ impl NoraPanel {
             if let Some(error) = session.last_error() {
                 ui.colored_label(colors.error, error);
             }
-            // The user just sent something: show it, even when they had scrolled up.
-            if std::mem::take(&mut self.scroll_to_end) {
-                ui.scroll_to_cursor(Some(Align::BOTTOM));
-            }
         });
+        let end = (shown.content_size.y - shown.inner_rect.height()).max(0.0);
+        // Asked again next frame while the view is short of the end (something came in the same frame).
+        self.scroll_to_end &= shown.state.offset.y < end - 0.5;
+        self.end_offset = end;
     }
 
     fn bubble(&self, ui: &mut Ui, message: &ChatMessage, colors: &Colors) {
@@ -503,6 +513,73 @@ mod tests {
         h.run();
         assert!(h.state().actions.is_empty());
         assert_eq!(h.state().panel.draft(), "line one\n");
+    }
+
+    /// The panel as a host runs it: each of its actions goes to the session in the same frame, and the session's
+    /// requests wait for the test to answer them.
+    struct Hosted {
+        panel: NoraPanel,
+        session: NoraSession,
+        requests: Vec<Output>,
+    }
+
+    /// A conversation taller than the panel: once the person sends, each of Nora's replies comes into view, even one
+    /// that lands while the view is still moving to the end (it used to stop one message short, for good).
+    #[test]
+    fn the_newest_reply_comes_into_view_after_a_send() {
+        let mut listed: Vec<Value> =
+            (0..12).map(|n| json!({ "role": "assistant", "text": format!("Earlier reply {n}, long enough to wrap in a narrow panel.") })).collect();
+        let mut nora = session();
+        let sent = nora.handle(Input::Send("Hello".into()));
+        answer(&mut nora, &sent[0], json!({ "thread_id": "t1" }));
+        let polls = nora.handle(Input::Tick { now_ms: 10 });
+        answer(&mut nora, &polls[0], json!({ "messages": listed }));
+        answer(&mut nora, &polls[1], json!({ "actions": [] }));
+        nora.handle(Input::Tick { now_ms: 20_000 });
+        let height = 300.0;
+        let mut h = Harness::builder().with_size(egui::vec2(360.0, height)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, state: &mut Hosted| {
+                for action in state.panel.show(ui, &state.session) {
+                    let out = state.session.handle(action.into_input());
+                    state.requests.extend(out);
+                }
+            },
+            Hosted { panel: NoraPanel::new(), session: nora, requests: Vec::new() },
+        );
+        h.run();
+        h.get_by_role(egui::accesskit::Role::MultilineTextInput).focus();
+        h.run_steps(3);
+        h.get_by_role(egui::accesskit::Role::MultilineTextInput).type_text("One more");
+        h.run_steps(3);
+        h.key_press(Key::Enter);
+        h.run_steps(1);
+        let state = h.state_mut();
+        let send = state.requests.drain(..).find(|output| matches!(output, Output::Http(_)));
+        answer(&mut state.session, &send.expect("the message went to the server"), json!({ "thread_id": "t1" }));
+        // Nora's acknowledgement lands two frames after the send, while the view is still on its way down.
+        h.run_steps(2);
+        let mut now = 20_000;
+        let mut reply = |h: &mut Harness<'_, Hosted>, text: &str| {
+            listed.push(json!({ "role": "assistant", "text": text }));
+            let state = h.state_mut();
+            loop {
+                now += 250;
+                let polls = state.session.handle(Input::Tick { now_ms: now });
+                if let [messages, actions] = polls.as_slice() {
+                    answer(&mut state.session, messages, json!({ "messages": listed }));
+                    answer(&mut state.session, actions, json!({ "actions": [] }));
+                    break;
+                }
+                assert!(now < 60_000, "the session never asked for Nora's replies");
+            }
+        };
+        reply(&mut h, "Passing this on, back in a moment.");
+        h.run_steps(60);
+        reply(&mut h, "The newest reply");
+        // Nora is still at work (her spinner keeps drawing): a second of frames, the view's time to settle.
+        h.run_steps(60);
+        let newest = h.get_by_label("The newest reply").rect();
+        assert!(newest.min.y >= 0.0 && newest.max.y <= height, "the reply is in view, not below the edge: {newest:?}");
     }
 
     #[test]
