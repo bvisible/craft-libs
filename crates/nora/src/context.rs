@@ -36,10 +36,24 @@ pub struct DocumentInfo {
     pub selection: Option<Selection>,
 }
 
+/// The longest file id a host may name ([`DocumentInfo::file_id`]).
+pub const MAX_FILE_ID_CHARS: usize = 140;
+
 impl DocumentInfo {
     /// A document known by its name only.
     pub fn named(name: impl Into<String>) -> Self {
         DocumentInfo { name: name.into(), id: None, pages: None, selection: None }
+    }
+
+    /// The id of the file a document is, as the page that hosts the editor names it (the Drive sends its
+    /// file's id with the file): kept when it reads as one, 1 to [`MAX_FILE_ID_CHARS`] ASCII letters, digits,
+    /// `-`, `_` or `.` once trimmed; `None` for anything else, which the editor then does not pass on. The
+    /// server never believes an id as it comes: it reads it again under the person's own rights.
+    pub fn file_id(raw: &str) -> Option<String> {
+        let id = raw.trim();
+        let well_formed =
+            !id.is_empty() && id.len() <= MAX_FILE_ID_CHARS && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        well_formed.then(|| id.to_string())
     }
 }
 
@@ -88,6 +102,21 @@ mod tests {
         let ctx = PageContext::editor(AppKind::Pdf, DocumentInfo::named("a.pdf"));
         let value: Value = serde_json::from_str(&ctx.to_json_string()).unwrap();
         assert_eq!(value, json!({"surface": "editor", "app": "pdf", "document": {"name": "a.pdf"}}));
+    }
+
+    #[test]
+    fn a_file_id_is_kept_only_when_it_reads_as_one() {
+        assert_eq!(DocumentInfo::file_id("3fcaa7893c"), Some("3fcaa7893c".to_string()));
+        assert_eq!(DocumentInfo::file_id("  a1-b_2.c  "), Some("a1-b_2.c".to_string()));
+        let too_long = "a".repeat(MAX_FILE_ID_CHARS + 1);
+        for junk in ["", "   ", "a b", "../x", "a/b", "x\u{0}", "é1", "<script>", too_long.as_str()] {
+            assert_eq!(DocumentInfo::file_id(junk), None, "{junk:?}");
+        }
+        assert!(DocumentInfo::file_id(&"a".repeat(MAX_FILE_ID_CHARS)).is_some());
+        let mut document = DocumentInfo::named("devis.xlsx");
+        document.id = DocumentInfo::file_id("3fcaa7893c");
+        let value: Value = serde_json::from_str(&PageContext::editor(AppKind::Sheet, document).to_json_string()).unwrap();
+        assert_eq!(value["document"], json!({"name": "devis.xlsx", "id": "3fcaa7893c"}));
     }
 
     #[test]
