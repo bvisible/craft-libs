@@ -11,6 +11,9 @@ pub enum AppKind {
     Sheet,
     Deck,
     Pdf,
+    /// The mail program (NeoMail): its "document" is the message or the conversation being read and
+    /// the message being written, and nothing Nora does there is sent.
+    Mail,
 }
 
 /// The selected text, when the editor has one.
@@ -89,7 +92,9 @@ mod tests {
 
     #[test]
     fn every_app_name_round_trips() {
-        for (kind, name) in [(AppKind::Word, "word"), (AppKind::Sheet, "sheet"), (AppKind::Deck, "deck"), (AppKind::Pdf, "pdf")] {
+        for (kind, name) in
+            [(AppKind::Word, "word"), (AppKind::Sheet, "sheet"), (AppKind::Deck, "deck"), (AppKind::Pdf, "pdf"), (AppKind::Mail, "mail")]
+        {
             let text = serde_json::to_string(&kind).unwrap();
             assert_eq!(text, format!("\"{name}\""));
             assert_eq!(serde_json::from_str::<AppKind>(&text).unwrap(), kind);
