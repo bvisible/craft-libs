@@ -142,8 +142,9 @@ pub struct NoraStyle {
     /// The widest a bubble gets, as a share of the panel width.
     pub max_bubble_share: f32,
     /// The app's bold font family (`FontFamily::Name`), for the bold words and headings of Nora's replies; `None`
-    /// draws them in the regular one, in the theme's strong colour. Only a family the app binds: egui stops on one it
-    /// does not know.
+    /// draws them twice in the regular one, a pixel apart, for an app with no bold face (a family that only names the
+    /// regular face, as NeoGrille's and NeoPrés's do in a web build, shows no bold: leave it `None`). Only a family
+    /// the app binds: egui stops on one it does not know.
     pub bold_family: Option<&'static str>,
 }
 
@@ -373,9 +374,23 @@ impl NoraPanel {
                     let base = egui::text::TextFormat::simple(body.clone(), text);
                     let bold = match self.style.bold_family {
                         Some(family) => markdown::Bold::Font(FontId::new(body.size, FontFamily::Name(family.into()))),
-                        None => markdown::Bold::Color(ui.visuals().strong_text_color()),
+                        None => markdown::Bold::Doubled,
                     };
-                    ui.add(Label::new(markdown::job(&words, &base, &bold, ui.visuals().code_bg_color)).wrap());
+                    // Laid out here, at the width a wrapping label takes, so that the bold words drawn again fall on it.
+                    let width = ui.available_width();
+                    let mut job = markdown::job(&words, &base, &bold, ui.visuals().code_bg_color);
+                    job.wrap.max_width = width;
+                    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+                    let shown = ui.add(Label::new(galley));
+                    // No bold face: the bold words a second time, one pixel to the right (markdown::bold_overlay).
+                    if bold == markdown::Bold::Doubled
+                        && let Some(mut overlay) = markdown::bold_overlay(&words, &base)
+                    {
+                        overlay.wrap.max_width = width;
+                        let overlay = ui.ctx().fonts_mut(|fonts| fonts.layout_job(overlay));
+                        let pixel = egui::vec2(1.0 / ui.pixels_per_point(), 0.0);
+                        ui.painter().galley(shown.rect.left_top() + pixel, overlay, text);
+                    }
                     let pages: Vec<(String, String)> = pieces
                         .into_iter()
                         .filter_map(|piece| match piece {
