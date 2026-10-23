@@ -906,18 +906,18 @@ mod tests {
         let mut h = opening(replied_with(reply, json!([])));
         assert!(h.query_by_label_contains("Le brouillon est prêt").is_some());
         assert!(h.query_by_label_contains("](").is_none(), "no Markdown left on screen");
+        assert_eq!(h.get_by_label("Ouvrir le brouillon").accesskit_node().role(), egui::accesskit::Role::Link);
+        assert_ne!(h.get_by_label("ce site").accesskit_node().role(), egui::accesskit::Role::Link, "a link elsewhere is only its words");
         h.get_by_label("Ouvrir le brouillon").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=4".into())]);
-        h.get_by_label("ce site").click();
-        h.run();
-        assert_eq!(h.state().actions.len(), 1, "a link elsewhere is only its words");
     }
 
     #[test]
     fn without_a_host_that_opens_pages_no_link_is_offered() {
         let mut h = harness(replied_with("[Ouvrir dans NeoDoc](/drive/f/abc)", json!([])));
         h.run();
+        assert_ne!(h.get_by_label("Ouvrir dans NeoDoc").accesskit_node().role(), egui::accesskit::Role::Link);
         h.get_by_label("Ouvrir dans NeoDoc").click();
         h.run();
         assert!(h.state().actions.is_empty());
