@@ -31,12 +31,14 @@
 //! Everything the user reads is in [`NoraLabels`] (English by default); an app passes its own
 //! translations. The colors follow the egui theme unless [`NoraStyle`] says otherwise.
 
+mod markdown;
+
 use std::time::Duration;
 
 use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraError, NoraSession, Output, Role, Segment, ShownCard, segments};
 use egui::{
-    Align, Button, CentralPanel, Color32, Context, CornerRadius, Event, Frame, Id, Key, KeyboardShortcut, Label, Layout, Margin, Modifiers, Panel,
-    RichText, ScrollArea, Stroke, TextEdit, Ui, Visuals,
+    Align, Button, CentralPanel, Color32, Context, CornerRadius, Event, FontFamily, FontId, Frame, Id, Key, KeyboardShortcut, Label, Layout, Margin,
+    Modifiers, Panel, RichText, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Visuals,
 };
 
 /// What the user did in the panel. The host turns it into a session input with
@@ -139,11 +141,24 @@ pub struct NoraStyle {
     pub bubble_padding: i8,
     /// The widest a bubble gets, as a share of the panel width.
     pub max_bubble_share: f32,
+    /// The app's bold font family (`FontFamily::Name`), for the bold words and headings of Nora's replies; `None`
+    /// draws them in the regular one, in the theme's strong colour. Only a family the app binds: egui stops on one it
+    /// does not know.
+    pub bold_family: Option<&'static str>,
 }
 
 impl Default for NoraStyle {
     fn default() -> Self {
-        NoraStyle { user_fill: None, user_text: None, nora_fill: None, nora_text: None, corner_radius: 10, bubble_padding: 8, max_bubble_share: 0.9 }
+        NoraStyle {
+            user_fill: None,
+            user_text: None,
+            nora_fill: None,
+            nora_text: None,
+            corner_radius: 10,
+            bubble_padding: 8,
+            max_bubble_share: 0.9,
+            bold_family: None,
+        }
     }
 }
 
@@ -353,7 +368,14 @@ impl NoraPanel {
                             Segment::Link { label, .. } => label.as_str(),
                         })
                         .collect();
-                    ui.add(Label::new(RichText::new(words).color(text)).wrap());
+                    // Her little Markdown drawn, not printed (markdown.rs): bold, italic, code, lists, headings in bold.
+                    let body = TextStyle::Body.resolve(ui.style());
+                    let base = egui::text::TextFormat::simple(body.clone(), text);
+                    let bold = match self.style.bold_family {
+                        Some(family) => markdown::Bold::Font(FontId::new(body.size, FontFamily::Name(family.into()))),
+                        None => markdown::Bold::Color(ui.visuals().strong_text_color()),
+                    };
+                    ui.add(Label::new(markdown::job(&words, &base, &bold, ui.visuals().code_bg_color)).wrap());
                     let pages: Vec<(String, String)> = pieces
                         .into_iter()
                         .filter_map(|piece| match piece {
@@ -364,7 +386,8 @@ impl NoraPanel {
                     if !pages.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             for (label, url) in pages {
-                                if ui.link(label).on_hover_text(url.as_str()).clicked() {
+                                // Its words as the reply shows them, the Markdown of a label drawn away.
+                                if ui.link(markdown::plain(&label)).on_hover_text(url.as_str()).clicked() {
                                     actions.push(PanelAction::OpenLink(url));
                                 }
                             }
@@ -927,6 +950,19 @@ mod tests {
         h.get_by_label("Ouvrir le brouillon").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=4".into())]);
+    }
+
+    // //// Neoffice — Nora's little Markdown drawn, not printed (markdown.rs).
+    #[test]
+    fn a_reply_s_markdown_is_drawn_not_printed() {
+        let reply = "Cette lettre est adressée à **Régie Exemple Sàrl** :\n- *brouillon*\n- objet `Livraison`\n## Suite\nVoir [ce site](https://elsewhere.example/x).";
+        let h = opening(replied_with(reply, json!([])));
+        assert!(
+            h.query_by_label("Cette lettre est adressée à Régie Exemple Sàrl :\n• brouillon\n• objet Livraison\nSuite\nVoir ce site.").is_some(),
+            "the words, their markers drawn"
+        );
+        assert!(h.query_by_label_contains("**").is_none(), "no star is shown");
+        assert!(h.query_by_label("ce site").is_none(), "a link from the Markdown is only its words");
     }
 
     #[test]
