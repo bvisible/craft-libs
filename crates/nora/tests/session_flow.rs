@@ -721,3 +721,128 @@ mod ai_core {
         }
     }
 }
+
+// //// Neoffice — the cards and the links of the pane, print and the PDF (step 7 of « Nora partout », 23.10.2026).
+
+/// One poll at `now` whose replies answer carries `cards` too.
+fn poll_with_cards(nora: &mut NoraSession, now: u64, replies: Value, cards: Value) -> Vec<Output> {
+    let outputs = nora.handle(Input::Tick { now_ms: now });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    let mut out = nora.handle(ok(&messages, json!({"success": true, "messages": replies, "cards": cards})));
+    out.extend(nora.handle(ok(&queue, json!({"success": true, "actions": []}))));
+    out
+}
+
+fn template_card(status: &str) -> Value {
+    json!({"token": "c-tpl", "kind": "Template", "status": status, "title": "Modèle de lettre", "conversation_id": "t1",
+           "payload": {"summary": "« Lettre.docx » devient le modèle", "confirm_label": "Confirmer"}})
+}
+
+#[test]
+fn the_cards_of_this_conversation_are_shown_under_the_reply_that_made_them() {
+    let mut nora = started();
+    poll_with_cards(
+        &mut nora,
+        100,
+        json!([{"role": "assistant", "text": "La lettre est prête."}]),
+        json!([
+            {"token": "c-doc", "kind": "Document", "status": "Executed", "title": "Lettre · Régie", "conversation_id": "t1",
+             "result": "shared", "payload": {"editor_url": "/drive/f/abc", "open_label": "Ouvrir dans NeoDoc"}},
+            {"token": "c-other", "kind": "Email", "status": "Pending", "title": "Ailleurs", "conversation_id": "t9"},
+            {"token": "c-old", "kind": "Email", "status": "Pending", "title": "Serveur ancien"}
+        ]),
+    );
+    let cards = nora.cards();
+    assert_eq!(cards.len(), 1, "the person's pending cards of other conversations are the desk's");
+    assert_eq!(cards[0].card.token, "c-doc");
+    assert_eq!(cards[0].after, None, "shown at the end while the turn runs");
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.cards()[0].after, Some(2), "under the reply once the turn ended");
+    // The same card again changes nothing; a new state is taken.
+    let sent = nora.handle(Input::Send("Et ensuite ?".into()));
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    nora.handle(ok(&post, json!({"thread_id": "t1"})));
+    poll_with_cards(&mut nora, 6_000, json!([]), json!([template_card("Pending")]));
+    assert_eq!(nora.cards().len(), 2);
+    assert_eq!(nora.cards()[0].after, Some(2), "a card shown stays where it was");
+}
+
+#[test]
+fn a_template_card_is_answered_once_through_its_own_door() {
+    let mut nora = started();
+    poll_with_cards(&mut nora, 100, json!([{"role": "assistant", "text": "Confirmez sur la carte."}]), json!([template_card("Pending")]));
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    let answer = nora.handle(Input::AnswerCard { token: "c-tpl".into(), approve: true });
+    let request = request_to(&answer, protocol::CONFIRM_TEMPLATE).clone();
+    assert_eq!(request.body, json!({"token": "c-tpl", "action": "approve"}));
+    assert!(nora.cards()[0].answering);
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "c-tpl".into(), approve: true })).is_empty(), "one answer");
+    nora.handle(ok(
+        &request,
+        json!({"success": true, "card": {"token": "c-tpl", "kind": "Template", "status": "Executed",
+        "title": "Modèle de lettre", "result": "Cette lettre est maintenant le modèle."}}),
+    ));
+    let shown = &nora.cards()[0];
+    assert!(!shown.answering && shown.card.status == "Executed" && !shown.card.awaits_the_person());
+    assert_eq!(shown.card.result.as_deref(), Some("Cette lettre est maintenant le modèle."));
+    assert_eq!(shown.card.conversation, "t1", "it stays this conversation's");
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "c-tpl".into(), approve: false })).is_empty(), "answered");
+}
+
+#[test]
+fn a_card_that_does_not_wait_for_the_person_is_never_answered_from_the_pane() {
+    let mut nora = started();
+    poll_with_cards(
+        &mut nora,
+        100,
+        json!([]),
+        json!([
+            {"token": "c-mail", "kind": "Email", "status": "Pending", "title": "Un e-mail", "conversation_id": "t1"}
+        ]),
+    );
+    assert_eq!(nora.cards().len(), 1);
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "c-mail".into(), approve: true })).is_empty());
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "nope".into(), approve: true })).is_empty());
+}
+
+#[test]
+fn only_a_page_of_the_instance_is_opened() {
+    let mut nora =
+        NoraSession::new(SessionConfig { instance_origin: Some("https://erp.example.test".into()), ..SessionConfig::default() }, context());
+    assert_eq!(nora.handle(Input::OpenLink("/drive/f/abc".into())), vec![Output::Open("/drive/f/abc".into())]);
+    assert_eq!(nora.handle(Input::OpenLink("https://erp.example.test/app/webmail?uid=4".into())), vec![Output::Open("/app/webmail?uid=4".into())]);
+    for refused in ["https://elsewhere.example/drive/f/abc", "//elsewhere.example/x", "javascript:alert(1)", "/api/method/x"] {
+        assert!(nora.handle(Input::OpenLink(refused.into())).is_empty(), "{refused}");
+    }
+    // Without the instance's origin (Neodesk), only a path is a page of it.
+    let mut desk = session();
+    assert!(desk.handle(Input::OpenLink("https://erp.example.test/drive/f/abc".into())).is_empty());
+}
+
+#[test]
+fn print_and_the_pdf_run_in_the_editor_without_a_question() {
+    let mut nora = started();
+    let out = poll(
+        &mut nora,
+        100,
+        json!([]),
+        json!([
+            {"action": "doc_print", "callback_id": "p1"},
+            {"action": "doc_export_pdf", "callback_id": "p2"}
+        ]),
+    );
+    let kinds: Vec<&DocActionKind> = documents(&out).into_iter().map(|call| &call.kind).collect();
+    assert_eq!(kinds, vec![&DocActionKind::Print, &DocActionKind::ExportPdf]);
+    assert!(nora.confirmations().is_empty(), "the print dialog is the person's yes; the PDF goes to a draft, never sent");
+}
+
+#[test]
+fn a_new_conversation_forgets_its_cards() {
+    let mut nora = started();
+    poll_with_cards(&mut nora, 100, json!([]), json!([template_card("Pending")]));
+    assert_eq!(nora.cards().len(), 1);
+    nora.handle(Input::Reset);
+    assert!(nora.cards().is_empty());
+}

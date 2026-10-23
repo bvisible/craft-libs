@@ -15,6 +15,12 @@ pub const GET_MESSAGES: &str = "/api/method/nora.api.chat.get_messages";
 pub const GET_ACTIONS: &str = "/api/method/nora.api.chat.get_browser_actions";
 /// Answers an observation Nora asked for, by its `callback_id` (kept one minute).
 pub const RECEIVE_OBSERVATION: &str = "/api/method/nora.api.page_observation.receive_observation";
+/// The person's yes or no on a card that waits for it in the pane (a letter to make the company's template): the only
+/// card a pane answers, through a door of its own that refuses any other (`nora.api.cards.confirm_template`).
+pub const CONFIRM_TEMPLATE: &str = "/api/method/nora.api.cards.confirm_template";
+/// The largest PDF a pane hands Nora (`doc_export_pdf`, for an e-mail draft): sent in base64, a third more, through
+/// a page that refuses a call over 4 MB; the server takes no more either (`neoffice_theme.letters.mail`).
+pub const MAX_PDF_BYTES: usize = 2_500_000;
 
 /// What the gateway answers at once, in the user's language, when a request is handed to a business
 /// desk ("Je transmets votre demande à votre pôle…"); the desk's real answer lands 10 to 70 seconds
@@ -68,6 +74,39 @@ pub fn observation_ok(result: Value) -> Value {
 /// What an editor answers when it could not or would not do what Nora asked.
 pub fn observation_error(message: &str) -> Value {
     json!({ "kind": "document", "ok": false, "error": message })
+}
+
+/// The body of the person's answer to a card ([`CONFIRM_TEMPLATE`]).
+pub fn card_answer_body(token: &str, approve: bool) -> Value {
+    json!({ "token": token, "action": if approve { "approve" } else { "reject" } })
+}
+
+/// What an editor answers to [`DocActionKind::ExportPdf`]: the PDF it made of the open document, `{ name, data, size }`
+/// with `data` in base64; refused past [`MAX_PDF_BYTES`] or when it is not a PDF.
+pub fn pdf_result(name: &str, bytes: &[u8]) -> Result<Value, String> {
+    if !bytes.starts_with(b"%PDF-") {
+        return Err("the document could not be made into a PDF".into());
+    }
+    if bytes.len() > MAX_PDF_BYTES {
+        return Err("the document's PDF is too large to go with an e-mail made by Nora: export it with File, Export, PDF".into());
+    }
+    Ok(json!({ "name": name, "data": base64(bytes), "size": bytes.len() }))
+}
+
+/// Standard base64 with padding (RFC 4648 §4).
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let sextet = |shift: u32| char::from(ALPHABET[((n >> shift) & 0x3f) as usize]);
+        out.push(sextet(18));
+        out.push(sextet(12));
+        out.push(if chunk.len() > 1 { sextet(6) } else { '=' });
+        out.push(if chunk.len() > 2 { sextet(0) } else { '=' });
+    }
+    out
 }
 
 /// Who wrote a message.
@@ -225,6 +264,59 @@ pub fn parse_messages(message: &Value) -> (Vec<ChatMessage>, Vec<Value>) {
     (replies, cards)
 }
 
+/// A card Nora's tools leave in the conversation (`nora.api.cards`): a document made (« Ouvrir dans NeoDoc »), an
+/// e-mail draft (« Ouvrir le brouillon »), a proposal the person confirms (a letter to make the company's template).
+/// Made by the server's code, never by the model; what it opens is checked again where it is opened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    pub token: String,
+    /// `Document`, `Template`, `Email`, `Dunning`.
+    pub kind: String,
+    /// `Pending`, `Approved`, `Executed`, `Failed`, `Rejected`, `Expired`.
+    pub status: String,
+    pub title: String,
+    /// The conversation it was made in; empty when the server is older than the field.
+    pub conversation: String,
+    /// Where its Open leads (`editor_url`), as the server wrote it.
+    pub open_url: Option<String>,
+    /// The words of its Open, in the person's language (« Ouvrir le brouillon »).
+    pub open_label: Option<String>,
+    /// What it proposes, in a sentence.
+    pub summary: Option<String>,
+    pub confirm_label: Option<String>,
+    pub refuse_label: Option<String>,
+    /// What came of it, once answered (« Le modèle de lettre de … est maintenant … »).
+    pub result: Option<String>,
+}
+
+impl Card {
+    /// Reads one card of `get_messages`; `None` without a token or a kind.
+    pub fn from_json(value: &Value) -> Option<Card> {
+        let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let payload = value.get("payload").cloned().unwrap_or(Value::Null);
+        Some(Card {
+            token: text(value, "token")?,
+            kind: text(value, "kind")?,
+            status: text(value, "status").unwrap_or_default(),
+            title: text(value, "title").unwrap_or_default(),
+            conversation: text(value, "conversation_id").unwrap_or_default(),
+            open_url: text(&payload, "editor_url"),
+            open_label: text(&payload, "open_label"),
+            summary: text(&payload, "summary"),
+            confirm_label: text(&payload, "confirm_label"),
+            refuse_label: text(&payload, "refuse_label"),
+            // A card shared as it was made says « shared »: nothing to tell the person.
+            result: text(value, "result").filter(|r| r != "shared"),
+        })
+    }
+
+    /// Whether it waits for the person's yes or no in the pane: a letter template to confirm, still pending. The
+    /// pane answers no other card: an e-mail waiting to leave is the desk's to send.
+    pub fn awaits_the_person(&self) -> bool {
+        self.kind == "Template" && self.status == "Pending"
+    }
+}
+
 /// The actions in the answer of `get_browser_actions`.
 pub fn parse_actions(message: &Value) -> Vec<RemoteAction> {
     message.get("actions").and_then(Value::as_array).map(|list| list.iter().map(RemoteAction::from_json).collect()).unwrap_or_default()
@@ -259,6 +351,12 @@ pub enum DocActionKind {
     Save,
     /// Undo the last change. Never sent by Nora: the panel's Undo button asks for it.
     Undo,
+    /// Open the print dialog on the document, as the editor lays it out (its PDF). The dialog is the person's yes:
+    /// nothing reaches a printer before they confirm in it.
+    Print,
+    /// Make the document's PDF and hand it to Nora ([`pdf_result`]), who joins it to an e-mail DRAFT in the
+    /// person's mailbox; nothing is sent.
+    ExportPdf,
 }
 
 impl DocActionKind {
@@ -278,6 +376,8 @@ impl DocActionKind {
             DocActionKind::RenderPage { page, .. } => format!("Look at page {page}"),
             DocActionKind::Save => "Save the document".into(),
             DocActionKind::Undo => "Undo the last change".into(),
+            DocActionKind::Print => "Print the document".into(),
+            DocActionKind::ExportPdf => "Make the document's PDF".into(),
         }
     }
 }
@@ -356,6 +456,8 @@ impl RemoteAction {
                 scale: value.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 4.0),
             },
             "doc_save" => DocActionKind::Save,
+            "doc_print" => DocActionKind::Print,
+            "doc_export_pdf" => DocActionKind::ExportPdf,
             _ => return unsupported("not a document action"),
         };
         RemoteAction::Doc(DocAction { callback_id, kind })
@@ -452,6 +554,61 @@ mod tests {
                 other => panic!("expected an unsupported action, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn print_and_the_pdf_are_document_actions_that_change_nothing() {
+        let actions = parse_actions(&json!({"actions": [
+            {"action": "doc_print", "callback_id": "c1"},
+            {"action": "doc_export_pdf", "callback_id": "c2"}
+        ]}));
+        assert!(matches!(&actions[0], RemoteAction::Doc(DocAction { kind: DocActionKind::Print, callback_id: Some(id) }) if id == "c1"));
+        assert!(matches!(&actions[1], RemoteAction::Doc(DocAction { kind: DocActionKind::ExportPdf, .. })));
+        assert!(!DocActionKind::Print.modifies() && !DocActionKind::ExportPdf.modifies());
+        assert_eq!(DocActionKind::Print.summary(), "Print the document");
+    }
+
+    #[test]
+    fn a_pdf_is_handed_in_base64_and_only_when_it_is_one_of_a_size_that_goes() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd, 0x00]), "//79AA==");
+        let pdf = b"%PDF-1.7 x";
+        let result = pdf_result("Lettre.pdf", pdf).unwrap();
+        assert_eq!(result, json!({"name": "Lettre.pdf", "data": base64(pdf), "size": pdf.len()}));
+        assert!(pdf_result("x.pdf", b"<html>").is_err());
+        let mut large = b"%PDF-".to_vec();
+        large.resize(MAX_PDF_BYTES + 1, b'0');
+        assert!(pdf_result("x.pdf", &large).is_err());
+        assert_eq!(card_answer_body("c1", true), json!({"token": "c1", "action": "approve"}));
+        assert_eq!(card_answer_body("c1", false)["action"], "reject");
+    }
+
+    #[test]
+    fn cards_are_read_with_what_they_open_and_what_they_wait_for() {
+        let card = Card::from_json(&json!({
+            "token": "c1", "kind": "Template", "status": "Pending", "title": "Modèle de lettre", "conversation_id": "t1",
+            "result": null,
+            "payload": {"summary": "« Lettre.docx » devient le modèle", "confirm_label": "Confirmer", "refuse_label": "Annuler"}
+        }))
+        .unwrap();
+        assert!(card.awaits_the_person());
+        assert_eq!((card.conversation.as_str(), card.confirm_label.as_deref()), ("t1", Some("Confirmer")));
+        let document = Card::from_json(&json!({
+            "token": "c2", "kind": "Document", "status": "Executed", "title": "Lettre · Régie", "result": "shared",
+            "payload": {"editor_url": "/drive/f/abc", "open_label": "Ouvrir dans NeoDoc"}
+        }))
+        .unwrap();
+        assert!(!document.awaits_the_person());
+        assert_eq!(document.open_url.as_deref(), Some("/drive/f/abc"));
+        assert_eq!(document.result, None, "« shared » says nothing to the person");
+        let email = Card::from_json(&json!({"token": "c3", "kind": "Email", "status": "Pending"})).unwrap();
+        assert!(!email.awaits_the_person(), "an e-mail waiting to leave is the desk's to send");
+        assert!(Card::from_json(&json!({"kind": "Document"})).is_none());
+        assert!(Card::from_json(&json!({"token": "c4"})).is_none());
     }
 
     #[test]

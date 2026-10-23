@@ -36,11 +36,13 @@ pub mod http;
 pub mod links;
 pub mod policy;
 pub mod protocol;
+pub mod reply;
 pub mod session;
 
 pub use context::{AppKind, DocumentInfo, PageContext, Selection};
 pub use error::NoraError;
 pub use http::{HttpRequest, HttpResponse, RequestId};
 pub use policy::{CommandPolicy, Decision};
-pub use protocol::{ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
-pub use session::{Confirmation, DocumentCall, Input, NoraSession, Output, SessionConfig};
+pub use protocol::{Card, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
+pub use reply::{Segment, instance_path, segments};
+pub use session::{Confirmation, DocumentCall, Input, NoraSession, Output, SessionConfig, ShownCard};

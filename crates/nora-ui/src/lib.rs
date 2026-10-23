@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraError, NoraSession, Output, Role};
+use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraError, NoraSession, Output, Role, Segment, ShownCard, segments};
 use egui::{
     Align, Button, CentralPanel, Color32, Context, CornerRadius, Event, Frame, Id, Key, KeyboardShortcut, Label, Layout, Margin, Modifiers, Panel,
     RichText, ScrollArea, Stroke, TextEdit, Ui, Visuals,
@@ -53,6 +53,10 @@ pub enum PanelAction {
     Undo,
     /// The user started a new conversation.
     NewConversation,
+    /// The user clicked a link of a reply or a card's Open (the session lets a page of the instance through only).
+    OpenLink(String),
+    /// The user answered a card that waits for them.
+    AnswerCard { token: String, approve: bool },
 }
 
 impl PanelAction {
@@ -64,6 +68,8 @@ impl PanelAction {
             PanelAction::Stop => Input::Cancel,
             PanelAction::Undo => Input::UndoLast,
             PanelAction::NewConversation => Input::Reset,
+            PanelAction::OpenLink(url) => Input::OpenLink(url),
+            PanelAction::AnswerCard { token, approve } => Input::AnswerCard { token, approve },
         }
     }
 }
@@ -89,6 +95,8 @@ pub struct NoraLabels {
     pub confirm_heading: String,
     pub allow: String,
     pub refuse: String,
+    /// A card's Open, when the card does not say its own words (« Ouvrir dans NeoDoc »).
+    pub open: String,
     /// One sentence for an action waiting for the user's yes or no. The default is the English
     /// summary of the core; an app that shows another language describes the action itself.
     pub describe: fn(&DocActionKind) -> String,
@@ -110,6 +118,7 @@ impl Default for NoraLabels {
             confirm_heading: "Nora wants to:".into(),
             allow: "Allow".into(),
             refuse: "Refuse".into(),
+            open: "Open".into(),
             describe: |kind| kind.summary(),
         }
     }
@@ -165,6 +174,9 @@ pub struct NoraPanel {
     /// Set when the host has no way to reach Nora: the panel then says why instead of offering a
     /// text box that would swallow the message.
     pub offline: Option<String>,
+    /// Whether the host opens a page of the instance ([`Output::Open`]): a link of a reply, a card's Open. Without
+    /// it a link is shown as its words, never as something to click that does nothing.
+    pub open_links: bool,
     draft: String,
     focus_input: bool,
     scroll_to_end: bool,
@@ -261,8 +273,20 @@ impl NoraPanel {
                 ui.add_space(ui.spacing().item_spacing.y * 4.0);
                 ui.vertical_centered(|ui| ui.weak(self.labels.empty.as_str()));
             }
-            for message in session.transcript() {
-                self.bubble(ui, message, colors);
+            // The cards of the conversation, each under the message it came after; those of the turn that runs, at the end.
+            let cards = session.cards();
+            let transcript = session.transcript();
+            for shown in cards.iter().filter(|shown| shown.after == Some(0)) {
+                self.card(ui, session, shown, colors, actions);
+            }
+            for (index, message) in transcript.iter().enumerate() {
+                self.bubble(ui, session, message, colors, actions);
+                for shown in cards.iter().filter(|shown| shown.after == Some(index + 1)) {
+                    self.card(ui, session, shown, colors, actions);
+                }
+            }
+            for shown in cards.iter().filter(|shown| shown.after.is_none_or(|after| after > transcript.len())) {
+                self.card(ui, session, shown, colors, actions);
             }
             let confirmations = session.confirmations();
             for confirmation in &confirmations {
@@ -292,7 +316,7 @@ impl NoraPanel {
         self.end_offset = end;
     }
 
-    fn bubble(&self, ui: &mut Ui, message: &ChatMessage, colors: &Colors) {
+    fn bubble(&self, ui: &mut Ui, session: &NoraSession, message: &ChatMessage, colors: &Colors, actions: &mut Vec<PanelAction>) {
         if message.text.trim().is_empty() {
             return;
         }
@@ -311,9 +335,82 @@ impl NoraPanel {
                 .inner_margin(Margin::same(self.style.bubble_padding))
                 .show(ui, |ui| {
                     ui.set_max_width(max_width);
-                    ui.add(Label::new(RichText::new(message.text.as_str()).color(text)).wrap());
+                    let pieces = if from_user { Vec::new() } else { segments(&message.text) };
+                    if !pieces.iter().any(|piece| matches!(piece, Segment::Link { .. })) {
+                        ui.add(Label::new(RichText::new(message.text.as_str()).color(text)).wrap());
+                        return;
+                    }
+                    // A reply with links: its words, and each link that leads to a page of the instance as a link.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for piece in pieces {
+                            match piece {
+                                Segment::Text(words) => {
+                                    ui.add(Label::new(RichText::new(words).color(text)).wrap());
+                                }
+                                Segment::Link { label, url } => {
+                                    if self.open_links && session.page_of(&url).is_some() {
+                                        if ui.link(label).on_hover_text(url.as_str()).clicked() {
+                                            actions.push(PanelAction::OpenLink(url));
+                                        }
+                                    } else {
+                                        ui.add(Label::new(RichText::new(label).color(text)).wrap());
+                                    }
+                                }
+                            }
+                        }
+                    });
                 });
         });
+        ui.add_space(ui.spacing().item_spacing.y);
+    }
+
+    /// A card of the conversation: what it is, what it says, its Open when it leads to a page of the instance, and the
+    /// person's yes or no when it waits for them (a letter to make the company's template).
+    fn card(&self, ui: &mut Ui, session: &NoraSession, shown: &ShownCard, colors: &Colors, actions: &mut Vec<PanelAction>) {
+        let card = &shown.card;
+        let waits = card.awaits_the_person();
+        let stroke = if waits { colors.warn } else { ui.visuals().widgets.noninteractive.bg_stroke.color };
+        Frame::new()
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(CornerRadius::same(self.style.corner_radius))
+            .inner_margin(Margin::same(self.style.bubble_padding))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if !card.title.is_empty() {
+                    ui.add(Label::new(RichText::new(card.title.as_str()).strong()).wrap());
+                }
+                if let Some(summary) = &card.summary {
+                    ui.add(Label::new(summary.as_str()).wrap());
+                }
+                if let Some(result) = card.result.as_deref().filter(|_| !waits) {
+                    ui.add(Label::new(RichText::new(result).weak()).wrap());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if waits {
+                        let confirm = card.confirm_label.as_deref().unwrap_or(self.labels.allow.as_str());
+                        let refuse = card.refuse_label.as_deref().unwrap_or(self.labels.refuse.as_str());
+                        if ui.add_enabled(!shown.answering, Button::new(confirm)).clicked() {
+                            actions.push(PanelAction::AnswerCard { token: card.token.clone(), approve: true });
+                        }
+                        if ui.add_enabled(!shown.answering, Button::new(refuse)).clicked() {
+                            actions.push(PanelAction::AnswerCard { token: card.token.clone(), approve: false });
+                        }
+                        if shown.answering {
+                            ui.spinner();
+                        }
+                    }
+                    if self.open_links
+                        && let Some(url) = card.open_url.as_deref()
+                        && session.page_of(url).is_some()
+                    {
+                        let words = card.open_label.as_deref().unwrap_or(self.labels.open.as_str());
+                        if ui.button(words).on_hover_text(url).clicked() {
+                            actions.push(PanelAction::OpenLink(url.to_string()));
+                        }
+                    }
+                });
+            });
         ui.add_space(ui.spacing().item_spacing.y);
     }
 
@@ -780,5 +877,83 @@ mod tests {
         // Five seconds after the conversation opened, the replies and the actions are read.
         assert_eq!(polls.len(), 2);
         assert!(matches!(&polls[0], Output::Http(request) if request.path.ends_with("get_messages")));
+    }
+
+    // //// Neoffice — the links of Nora's replies and the cards of the conversation (step 7 of « Nora partout »).
+
+    /// A finished conversation whose reply is `text` and whose answer carried `cards`.
+    fn replied_with(text: &str, cards: Value) -> NoraSession {
+        let mut nora = session();
+        let sent = nora.handle(Input::Send("Imprime-la".into()));
+        answer(&mut nora, &sent[0], json!({ "thread_id": "t1" }));
+        let polls = nora.handle(Input::Tick { now_ms: 10 });
+        answer(&mut nora, &polls[0], json!({ "messages": [{ "role": "assistant", "text": text }], "cards": cards }));
+        answer(&mut nora, &polls[1], json!({ "actions": [] }));
+        nora.handle(Input::Tick { now_ms: 20_000 });
+        nora
+    }
+
+    fn opening(session: NoraSession) -> Harness<'static, State> {
+        let mut h = harness(session);
+        h.state_mut().panel.open_links = true;
+        h.run();
+        h
+    }
+
+    #[test]
+    fn a_link_to_a_page_of_the_instance_is_a_link_and_any_other_is_its_words() {
+        let reply = "Le brouillon est prêt : [Ouvrir le brouillon](/app/webmail?uid=4). Voir aussi [ce site](https://elsewhere.example/x).";
+        let mut h = opening(replied_with(reply, json!([])));
+        assert!(h.query_by_label_contains("Le brouillon est prêt").is_some());
+        assert!(h.query_by_label_contains("](").is_none(), "no Markdown left on screen");
+        h.get_by_label("Ouvrir le brouillon").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=4".into())]);
+        h.get_by_label("ce site").click();
+        h.run();
+        assert_eq!(h.state().actions.len(), 1, "a link elsewhere is only its words");
+    }
+
+    #[test]
+    fn without_a_host_that_opens_pages_no_link_is_offered() {
+        let mut h = harness(replied_with("[Ouvrir dans NeoDoc](/drive/f/abc)", json!([])));
+        h.run();
+        h.get_by_label("Ouvrir dans NeoDoc").click();
+        h.run();
+        assert!(h.state().actions.is_empty());
+    }
+
+    #[test]
+    fn a_document_card_opens_its_document() {
+        let cards = json!([{ "token": "c1", "kind": "Document", "status": "Executed", "title": "Brouillon · Fuite d'eau",
+            "conversation_id": "t1", "result": "shared",
+            "payload": { "editor_url": "/app/webmail?uid=4", "open_label": "Ouvrir le brouillon" } }]);
+        let mut h = opening(replied_with("C'est prêt.", cards));
+        assert!(h.query_by_label("Brouillon · Fuite d'eau").is_some());
+        assert!(h.query_by_label("shared").is_none());
+        h.get_by_label("Ouvrir le brouillon").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=4".into())]);
+    }
+
+    #[test]
+    fn a_template_card_is_confirmed_or_refused_with_its_own_words() {
+        let cards = json!([{ "token": "c2", "kind": "Template", "status": "Pending", "title": "Modèle de lettre",
+            "conversation_id": "t1",
+            "payload": { "summary": "« Lettre.docx » devient le modèle de lettre.", "confirm_label": "Confirmer",
+                         "refuse_label": "Annuler" } }]);
+        let mut h = opening(replied_with("Confirmez sur la carte.", cards));
+        assert!(h.query_by_label("« Lettre.docx » devient le modèle de lettre.").is_some());
+        h.get_by_label("Confirmer").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::AnswerCard { token: "c2".into(), approve: true }]);
+        h.get_by_label("Annuler").click();
+        h.run();
+        assert_eq!(h.state().actions.last(), Some(&PanelAction::AnswerCard { token: "c2".into(), approve: false }));
+        assert!(matches!(
+            PanelAction::AnswerCard { token: "c2".into(), approve: true }.into_input(),
+            Input::AnswerCard { token, approve: true } if token == "c2"
+        ));
+        assert!(matches!(PanelAction::OpenLink("/x".into()).into_input(), Input::OpenLink(url) if url == "/x"));
     }
 }

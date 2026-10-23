@@ -9,9 +9,10 @@ use crate::error::NoraError;
 use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
-    self, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, observation_body, observation_error, observation_ok, parse_actions,
-    parse_messages, post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of,
+    self, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, card_answer_body, observation_body, observation_error, observation_ok,
+    parse_actions, parse_messages, post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of,
 };
+use crate::reply::instance_path;
 
 /// What Nora is told about an action that will not run because the user stopped it.
 const STOPPED: &str = "the user stopped Nora";
@@ -36,6 +37,10 @@ pub struct SessionConfig {
     /// Lowercase phrases that mark an acknowledgement rather than an answer. Defaults to
     /// [`protocol::ACK_ANCHORS`]; a host that has the server's live list passes it here.
     pub ack_anchors: Vec<String>,
+    /// The origin the page that frames the editor shares with the person's instance (the Drive's), when it does: an
+    /// address of it in a reply is a page of the instance too ([`crate::reply::instance_path`]). `None` where the
+    /// page is not the instance's (Neodesk): only a path is.
+    pub instance_origin: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -48,6 +53,7 @@ impl Default for SessionConfig {
             max_silence_ms: 480_000,
             settle_ms: 1_500,
             ack_anchors: protocol::ACK_ANCHORS.iter().map(|anchor| anchor.to_string()).collect(),
+            instance_origin: None,
         }
     }
 }
@@ -76,6 +82,11 @@ pub enum Input {
     UndoLast,
     /// The user started a new conversation.
     Reset,
+    /// The user clicked a link of a reply or a card's Open: a page of the instance is opened ([`Output::Open`]),
+    /// anything else is not.
+    OpenLink(String),
+    /// The user answered a card that waits for them ([`Card::awaits_the_person`]): yes or no.
+    AnswerCard { token: String, approve: bool },
 }
 
 /// What a session asks of the host.
@@ -87,6 +98,9 @@ pub enum Output {
     Document(DocumentCall),
     /// The transcript, the busy state, the error or the confirmations changed: repaint.
     Changed,
+    /// Open this page of the person's instance (a path: `/drive/f/…`), on the person's click: the host knows the
+    /// instance (the Drive's page is on it, Neodesk signs in to it) and opens it its own way.
+    Open(String),
 }
 
 /// An action for the editor to run through its own control channel.
@@ -94,6 +108,17 @@ pub enum Output {
 pub struct DocumentCall {
     pub id: u64,
     pub kind: DocActionKind,
+}
+
+/// A card of the conversation, as the panel shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShownCard {
+    pub card: Card,
+    /// Where it goes in the transcript: after that many messages. `None` while the turn that made it runs: it is
+    /// shown at the end, under the replies of the turn, and stays there once the turn ends.
+    pub after: Option<usize>,
+    /// The person's answer to it is on its way to the server.
+    pub answering: bool,
 }
 
 /// An action waiting for the user's yes or no.
@@ -114,6 +139,8 @@ enum Pending {
     /// refused, not run.
     StoppedActions,
     Observation,
+    /// The person's answer to the card of this token.
+    CardAnswer(String),
 }
 
 /// How the last message's turn ended.
@@ -169,6 +196,8 @@ pub struct NoraSession {
     /// may go on with the stopped message and queue actions for it, in the queue the next messages
     /// read. A queue stamped before the current message holds that work only, and is refused.
     refuse_older_actions: bool,
+    /// The cards of this conversation, in the order they came.
+    cards: Vec<ShownCard>,
 }
 
 impl NoraSession {
@@ -196,6 +225,7 @@ impl NoraSession {
             changes: Vec::new(),
             outcome: None,
             refuse_older_actions: false,
+            cards: Vec::new(),
         }
     }
 
@@ -212,8 +242,22 @@ impl NoraSession {
             Input::Cancel => self.on_cancel(&mut out),
             Input::UndoLast => self.on_undo(&mut out),
             Input::Reset => self.on_reset(&mut out),
+            Input::OpenLink(url) => self.on_open(&url, &mut out),
+            Input::AnswerCard { token, approve } => self.on_answer_card(&token, approve, &mut out),
         }
         out
+    }
+
+    /// The cards of this conversation (a document made, an e-mail draft, a proposal to confirm), in the order they
+    /// came, each with its place in the transcript.
+    pub fn cards(&self) -> &[ShownCard] {
+        &self.cards
+    }
+
+    /// The path of the instance's page a link leads to, when the panel may open it ([`crate::reply::instance_path`]
+    /// with this session's instance origin).
+    pub fn page_of(&self, url: &str) -> Option<String> {
+        instance_path(url, self.cfg.instance_origin.as_deref())
     }
 
     /// The conversation so far, oldest first.
@@ -315,8 +359,8 @@ impl NoraSession {
             return;
         }
         let nothing_running = self.running.is_empty() && self.waiting.is_empty();
-        let nothing_pending =
-            nothing_running && self.inflight.values().all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions));
+        let nothing_pending = nothing_running
+            && self.inflight.values().all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions | Pending::CardAnswer(_)));
         // Done first, so that a finished turn ends without one more poll. The final reply is in and the
         // actions queued with it have had their moment...
         let settled = self.final_seen_ms.is_some_and(|seen| now_ms.saturating_sub(seen) >= self.cfg.settle_ms);
@@ -355,7 +399,16 @@ impl NoraSession {
         self.busy = false;
         self.next_poll_ms = None;
         self.outcome = Some(TurnEnd::Answered);
+        self.anchor_cards();
         out.push(Output::Changed);
+    }
+
+    /// The cards of the turn that ended stay where they were shown: under its replies.
+    fn anchor_cards(&mut self) {
+        let end = self.transcript.len();
+        for shown in self.cards.iter_mut().filter(|shown| shown.after.is_none()) {
+            shown.after = Some(end);
+        }
     }
 
     fn on_http(&mut self, response: HttpResponse, out: &mut Vec<Output>) {
@@ -406,6 +459,26 @@ impl NoraSession {
                 self.last_failure = Some(error);
                 out.push(Output::Changed);
             }
+            (Pending::CardAnswer(token), Ok(message)) => {
+                self.last_error = None;
+                self.last_failure = None;
+                let answered = message.get("card").and_then(Card::from_json);
+                if let Some(shown) = self.cards.iter_mut().find(|shown| shown.card.token == token) {
+                    shown.answering = false;
+                    if let Some(card) = answered.filter(|card| card.token == token) {
+                        shown.card = Card { conversation: shown.card.conversation.clone(), ..card };
+                    }
+                }
+                out.push(Output::Changed);
+            }
+            (Pending::CardAnswer(token), Err(error)) => {
+                if let Some(shown) = self.cards.iter_mut().find(|shown| shown.card.token == token) {
+                    shown.answering = false;
+                }
+                self.last_error = Some(error.to_string());
+                self.last_failure = Some(error);
+                out.push(Output::Changed);
+            }
             (Pending::StoppedActions | Pending::Observation, _) => {}
         }
     }
@@ -416,6 +489,7 @@ impl NoraSession {
         self.outcome = Some(TurnEnd::Failed(error));
         self.busy = false;
         self.next_poll_ms = None;
+        self.anchor_cards();
         out.push(Output::Changed);
     }
 
@@ -433,6 +507,7 @@ impl NoraSession {
         self.final_seen_ms = None;
         self.outcome = Some(TurnEnd::Stopped);
         self.refuse_older_actions = true;
+        self.anchor_cards();
         self.inflight.retain(|_, pending| !matches!(pending, Pending::Send | Pending::Messages));
         for pending in self.inflight.values_mut() {
             if matches!(pending, Pending::Actions) {
@@ -462,13 +537,13 @@ impl NoraSession {
     /// order they came; the user's own messages are added when sent. An acknowledgement is shown and
     /// the wait goes on; the first reply that is an answer ends it.
     fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) {
-        let (replies, _cards) = parse_messages(message);
+        let (replies, cards) = parse_messages(message);
         let replies: Vec<ChatMessage> = replies.into_iter().filter(|reply| reply.role != Role::User).collect();
         let fresh = self.fresh_replies(replies);
-        if fresh.is_empty() {
-            return;
+        let mut changed = !fresh.is_empty();
+        if changed {
+            self.last_activity_ms = self.now_ms;
         }
-        self.last_activity_ms = self.now_ms;
         for reply in fresh {
             if self.final_seen_ms.is_none() && !self.is_interim(&reply) {
                 self.final_seen_ms = Some(self.now_ms);
@@ -477,7 +552,35 @@ impl NoraSession {
                 self.transcript.push(reply);
             }
         }
-        out.push(Output::Changed);
+        // After the replies, so that a card that came with its reply is shown under it.
+        changed |= self.absorb_cards(&cards);
+        if changed {
+            out.push(Output::Changed);
+        }
+    }
+
+    /// Takes in the cards of THIS conversation (the server's list also holds the person's pending proposals of every
+    /// other one, for the desk); a card already shown gets its new state, unless the person's answer is on its way.
+    /// Whether anything changed.
+    fn absorb_cards(&mut self, cards: &[Value]) -> bool {
+        let Some(thread) = self.thread_id.clone() else { return false };
+        let mut changed = false;
+        for card in cards.iter().filter_map(Card::from_json).filter(|card| card.conversation == thread) {
+            match self.cards.iter_mut().find(|shown| shown.card.token == card.token) {
+                Some(shown) => {
+                    if !shown.answering && shown.card != card {
+                        shown.card = card;
+                        changed = true;
+                    }
+                }
+                None => {
+                    let after = (!self.busy).then_some(self.transcript.len());
+                    self.cards.push(ShownCard { card, after, answering: false });
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// The replies of the list that are new. With the server time of the send, a reply stamped after
@@ -623,6 +726,25 @@ impl NoraSession {
         self.changes.clear();
         self.outcome = None;
         self.refuse_older_actions = false;
+        self.cards.clear();
+        out.push(Output::Changed);
+    }
+
+    /// A link the person clicked: a page of the instance goes to the host, anything else nowhere.
+    fn on_open(&mut self, url: &str, out: &mut Vec<Output>) {
+        if let Some(path) = self.page_of(url) {
+            out.push(Output::Open(path));
+        }
+    }
+
+    /// The person's yes or no on a card that waits for it, once: a second click while the answer travels does nothing.
+    fn on_answer_card(&mut self, token: &str, approve: bool, out: &mut Vec<Output>) {
+        let Some(index) = self.cards.iter().position(|shown| shown.card.token == token && shown.card.awaits_the_person() && !shown.answering) else {
+            return;
+        };
+        self.cards[index].answering = true;
+        let request = self.request(protocol::CONFIRM_TEMPLATE, card_answer_body(token, approve), Pending::CardAnswer(token.to_string()));
+        out.push(request);
         out.push(Output::Changed);
     }
 }
