@@ -335,31 +335,38 @@ impl NoraPanel {
                 .inner_margin(Margin::same(self.style.bubble_padding))
                 .show(ui, |ui| {
                     ui.set_max_width(max_width);
-                    let pieces = if from_user { Vec::new() } else { segments(&message.text) };
-                    if !pieces.iter().any(|piece| matches!(piece, Segment::Link { .. })) {
+                    if from_user {
                         ui.add(Label::new(RichText::new(message.text.as_str()).color(text)).wrap());
                         return;
                     }
-                    // A reply with links: its words, and each link that leads to a page of the instance as a link.
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for piece in pieces {
-                            match piece {
-                                Segment::Text(words) => {
-                                    ui.add(Label::new(RichText::new(words).color(text)).wrap());
-                                }
-                                Segment::Link { label, url } => {
-                                    if self.open_links && session.page_of(&url).is_some() {
-                                        if ui.link(label).on_hover_text(url.as_str()).clicked() {
-                                            actions.push(PanelAction::OpenLink(url));
-                                        }
-                                    } else {
-                                        ui.add(Label::new(RichText::new(label).color(text)).wrap());
-                                    }
+                    // A reply with links: its words as one text (a link's own words in it), then, on a row of their own,
+                    // the links that lead to a page of the instance. Laid out apart, a link is never under another
+                    // widget's words (an egui text that wraps in a row takes the row's width from its start).
+                    let pieces = segments(&message.text);
+                    let words: String = pieces
+                        .iter()
+                        .map(|piece| match piece {
+                            Segment::Text(words) => words.as_str(),
+                            Segment::Link { label, .. } => label.as_str(),
+                        })
+                        .collect();
+                    ui.add(Label::new(RichText::new(words).color(text)).wrap());
+                    let pages: Vec<(String, String)> = pieces
+                        .into_iter()
+                        .filter_map(|piece| match piece {
+                            Segment::Link { label, url } if self.open_links && session.page_of(&url).is_some() => Some((label, url)),
+                            _ => None,
+                        })
+                        .collect();
+                    if !pages.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, url) in pages {
+                                if ui.link(label).on_hover_text(url.as_str()).clicked() {
+                                    actions.push(PanelAction::OpenLink(url));
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                 });
         });
         ui.add_space(ui.spacing().item_spacing.y);
@@ -904,16 +911,11 @@ mod tests {
     fn a_link_to_a_page_of_the_instance_is_a_link_and_any_other_is_its_words() {
         let reply = "Le brouillon est prêt : [Ouvrir le brouillon](/app/webmail?uid=4). Voir aussi [ce site](https://elsewhere.example/x).";
         let mut h = opening(replied_with(reply, json!([])));
-        assert!(h.query_by_label_contains("Le brouillon est prêt").is_some());
-        assert!(h.query_by_label_contains("](").is_none(), "no Markdown left on screen");
+        assert!(h.query_by_label("Le brouillon est prêt : Ouvrir le brouillon. Voir aussi ce site.").is_some(), "the words, no Markdown");
+        assert!(h.query_by_label("ce site").is_none(), "a link elsewhere is only its words");
         h.get_by_label("Ouvrir le brouillon").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=4".into())]);
-        // A fresh panel: the words of a link elsewhere are only words.
-        let mut h = opening(replied_with(reply, json!([])));
-        h.get_by_label("ce site").click();
-        h.run();
-        assert!(h.state().actions.is_empty(), "{:?}", h.state().actions);
     }
 
     #[test]
