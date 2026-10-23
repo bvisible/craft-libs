@@ -43,6 +43,6 @@ pub use context::{AppKind, DocumentInfo, PageContext, Selection};
 pub use error::NoraError;
 pub use http::{HttpRequest, HttpResponse, RequestId};
 pub use policy::{CommandPolicy, Decision};
-pub use protocol::{Card, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
+pub use protocol::{Card, CardChoice, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
 pub use reply::{Segment, instance_path, segments};
 pub use session::{Confirmation, DocumentCall, Input, NoraSession, Output, SessionConfig, ShownCard};

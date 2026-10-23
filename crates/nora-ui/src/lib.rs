@@ -57,6 +57,8 @@ pub enum PanelAction {
     OpenLink(String),
     /// The user answered a card that waits for them.
     AnswerCard { token: String, approve: bool },
+    /// The user picked one of the choices of a card that waits for them (a mailbox to write a draft from).
+    ChooseOnCard { token: String, choice: String },
 }
 
 impl PanelAction {
@@ -70,6 +72,7 @@ impl PanelAction {
             PanelAction::NewConversation => Input::Reset,
             PanelAction::OpenLink(url) => Input::OpenLink(url),
             PanelAction::AnswerCard { token, approve } => Input::AnswerCard { token, approve },
+            PanelAction::ChooseOnCard { token, choice } => Input::ChooseOnCard { token, choice },
         }
     }
 }
@@ -373,7 +376,8 @@ impl NoraPanel {
     }
 
     /// A card of the conversation: what it is, what it says, its Open when it leads to a page of the instance, and the
-    /// person's yes or no when it waits for them (a letter to make the company's template).
+    /// person's answer when it waits for them: yes or no (a letter to make the company's template), or one of its
+    /// choices or no (a mailbox to write a draft from).
     fn card(&self, ui: &mut Ui, session: &NoraSession, shown: &ShownCard, colors: &Colors, actions: &mut Vec<PanelAction>) {
         let card = &shown.card;
         let waits = card.awaits_the_person();
@@ -395,10 +399,17 @@ impl NoraPanel {
                 }
                 ui.horizontal_wrapped(|ui| {
                     if waits {
-                        let confirm = card.confirm_label.as_deref().unwrap_or(self.labels.allow.as_str());
                         let refuse = card.refuse_label.as_deref().unwrap_or(self.labels.refuse.as_str());
-                        if ui.add_enabled(!shown.answering, Button::new(confirm)).clicked() {
-                            actions.push(PanelAction::AnswerCard { token: card.token.clone(), approve: true });
+                        if card.choices.is_empty() {
+                            let confirm = card.confirm_label.as_deref().unwrap_or(self.labels.allow.as_str());
+                            if ui.add_enabled(!shown.answering, Button::new(confirm)).clicked() {
+                                actions.push(PanelAction::AnswerCard { token: card.token.clone(), approve: true });
+                            }
+                        }
+                        for choice in &card.choices {
+                            if ui.add_enabled(!shown.answering, Button::new(choice.label.as_str())).clicked() {
+                                actions.push(PanelAction::ChooseOnCard { token: card.token.clone(), choice: choice.id.clone() });
+                            }
                         }
                         if ui.add_enabled(!shown.answering, Button::new(refuse)).clicked() {
                             actions.push(PanelAction::AnswerCard { token: card.token.clone(), approve: false });
@@ -959,5 +970,26 @@ mod tests {
             Input::AnswerCard { token, approve: true } if token == "c2"
         ));
         assert!(matches!(PanelAction::OpenLink("/x".into()).into_input(), Input::OpenLink(url) if url == "/x"));
+    }
+
+    #[test]
+    fn a_mailbox_card_offers_its_choices_and_its_no_but_no_bare_yes() {
+        let cards = json!([{ "token": "c3", "kind": "Mailbox", "status": "Pending", "title": "Brouillon d'e-mail",
+            "conversation_id": "t1",
+            "payload": { "summary": "Vous n'avez pas de boîte à vous : depuis laquelle écrire le brouillon ?",
+                         "confirm_label": "Confirmer", "refuse_label": "Annuler",
+                         "choices": [{ "id": "Bureau", "label": "Bureau (bureau@exemple.ch)" }] } }]);
+        let mut h = opening(replied_with("Choisissez la boîte sur la carte.", cards));
+        assert!(h.query_by_label("Confirmer").is_none(), "a card that asks for a choice has no bare yes");
+        h.get_by_label("Bureau (bureau@exemple.ch)").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::ChooseOnCard { token: "c3".into(), choice: "Bureau".into() }]);
+        h.get_by_label("Annuler").click();
+        h.run();
+        assert_eq!(h.state().actions.last(), Some(&PanelAction::AnswerCard { token: "c3".into(), approve: false }));
+        assert!(matches!(
+            PanelAction::ChooseOnCard { token: "c3".into(), choice: "Bureau".into() }.into_input(),
+            Input::ChooseOnCard { token, choice } if token == "c3" && choice == "Bureau"
+        ));
     }
 }

@@ -838,6 +838,62 @@ fn print_and_the_pdf_run_in_the_editor_without_a_question() {
     assert!(nora.confirmations().is_empty(), "the print dialog is the person's yes; the PDF goes to a draft, never sent");
 }
 
+fn mailbox_card(status: &str) -> Value {
+    json!({"token": "c-box", "kind": "Mailbox", "status": status, "title": "Brouillon d'e-mail", "conversation_id": "t1",
+    "payload": {"summary": "Depuis quelle boîte ?", "refuse_label": "Annuler", "choices": [
+        {"id": "Bureau", "label": "Bureau (bureau@exemple.ch)"},
+        {"id": "Ventes", "label": "Ventes (ventes@exemple.ch)"}
+    ]}})
+}
+
+#[test]
+fn a_mailbox_card_is_answered_by_one_of_its_choices_once_through_the_pane_s_door() {
+    let mut nora = started();
+    poll_with_cards(&mut nora, 100, json!([{"role": "assistant", "text": "Choisissez la boîte."}]), json!([mailbox_card("Pending")]));
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    // A bare yes is no choice, and a choice the card does not offer is none either.
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "c-box".into(), approve: true })).is_empty());
+    assert!(requests(&nora.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Direction".into() })).is_empty());
+    assert!(!nora.cards()[0].answering);
+    let chosen = nora.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Ventes".into() });
+    let request = request_to(&chosen, protocol::ANSWER_IN_PANE).clone();
+    assert_eq!(request.body, json!({"token": "c-box", "action": "approve", "choice": "Ventes"}));
+    assert!(nora.cards()[0].answering);
+    assert!(requests(&nora.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Bureau".into() })).is_empty(), "one answer");
+    nora.handle(ok(
+        &request,
+        json!({"success": true, "card": {"token": "c-box", "kind": "Mailbox", "status": "Executed", "title": "Brouillon d'e-mail",
+        "result": "Le brouillon est dans la boîte Ventes.", "payload": {"editor_url": "/app/webmail?account=Ventes&folder=Drafts&uid=7",
+        "open_label": "Ouvrir le brouillon"}}}),
+    ));
+    let shown = &nora.cards()[0];
+    assert!(!shown.answering && !shown.card.awaits_the_person());
+    assert_eq!(shown.card.open_url.as_deref(), Some("/app/webmail?account=Ventes&folder=Drafts&uid=7"));
+    assert!(requests(&nora.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Bureau".into() })).is_empty(), "answered");
+}
+
+#[test]
+fn a_mailbox_card_s_no_goes_through_the_pane_s_door() {
+    let mut nora = started();
+    poll_with_cards(&mut nora, 100, json!([]), json!([mailbox_card("Pending")]));
+    let refused = nora.handle(Input::AnswerCard { token: "c-box".into(), approve: false });
+    let request = request_to(&refused, protocol::ANSWER_IN_PANE).clone();
+    assert_eq!(request.body, json!({"token": "c-box", "action": "reject"}));
+    // A card that is no longer pending offers nothing.
+    let mut later = started();
+    poll_with_cards(&mut later, 100, json!([]), json!([mailbox_card("Expired")]));
+    assert!(requests(&later.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Bureau".into() })).is_empty());
+}
+
+#[test]
+fn the_document_s_file_is_handed_without_a_question() {
+    let mut nora = started();
+    let out = poll(&mut nora, 100, json!([]), json!([{"action": "doc_export_file", "callback_id": "f1"}]));
+    let kinds: Vec<&DocActionKind> = documents(&out).into_iter().map(|call| &call.kind).collect();
+    assert_eq!(kinds, vec![&DocActionKind::ExportFile]);
+    assert!(nora.confirmations().is_empty(), "the file goes to a draft, never sent, never saved");
+}
+
 #[test]
 fn a_new_conversation_forgets_its_cards() {
     let mut nora = started();

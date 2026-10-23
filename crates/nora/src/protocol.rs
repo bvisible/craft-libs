@@ -18,9 +18,19 @@ pub const RECEIVE_OBSERVATION: &str = "/api/method/nora.api.page_observation.rec
 /// The person's yes or no on a card that waits for it in the pane (a letter to make the company's template): the only
 /// card a pane answers, through a door of its own that refuses any other (`nora.api.cards.confirm_template`).
 pub const CONFIRM_TEMPLATE: &str = "/api/method/nora.api.cards.confirm_template";
+/// The person's answer to any other card that waits for them in the pane: a mailbox to write an e-mail draft from,
+/// chosen among those shared with them ([`Card::choices`]), or no. Through a door of its own that answers only the cards
+/// a pane may answer (`nora.api.cards.answer_in_pane`); a template card keeps [`CONFIRM_TEMPLATE`], which every server
+/// that makes one has.
+pub const ANSWER_IN_PANE: &str = "/api/method/nora.api.cards.answer_in_pane";
 /// The largest PDF a pane hands Nora (`doc_export_pdf`, for an e-mail draft): sent in base64, a third more, through
 /// a page that refuses a call over 4 MB; the server takes no more either (`neoffice_theme.letters.mail`).
 pub const MAX_PDF_BYTES: usize = 2_500_000;
+/// The largest document a pane hands Nora in its own format (`doc_export_file`, for an e-mail draft): the same road
+/// as the PDF, the same limit.
+pub const MAX_FILE_BYTES: usize = MAX_PDF_BYTES;
+/// The most choices a card offers the pane (mailboxes to write from): more are not shown.
+pub const MAX_CARD_CHOICES: usize = 8;
 
 /// What the gateway answers at once, in the user's language, when a request is handed to a business
 /// desk ("Je transmets votre demande à votre pôle…"); the desk's real answer lands 10 to 70 seconds
@@ -79,6 +89,28 @@ pub fn observation_error(message: &str) -> Value {
 /// The body of the person's answer to a card ([`CONFIRM_TEMPLATE`]).
 pub fn card_answer_body(token: &str, approve: bool) -> Value {
     json!({ "token": token, "action": if approve { "approve" } else { "reject" } })
+}
+
+/// The body of the person's choice on a card ([`ANSWER_IN_PANE`]): one of its [`Card::choices`], by its id.
+pub fn card_choice_body(token: &str, choice: &str) -> Value {
+    json!({ "token": token, "action": "approve", "choice": choice })
+}
+
+/// The body of the person's no to a card answered through [`ANSWER_IN_PANE`].
+pub fn card_refusal_body(token: &str) -> Value {
+    json!({ "token": token, "action": "reject" })
+}
+
+/// What an editor answers to [`DocActionKind::ExportFile`]: the open document in its own format, as it is now (unsaved
+/// changes included), `{ name, data, size }` with `data` in base64; refused when empty or past [`MAX_FILE_BYTES`].
+pub fn file_result(name: &str, bytes: &[u8]) -> Result<Value, String> {
+    if bytes.is_empty() {
+        return Err("the document could not be written in its format".into());
+    }
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err("the document is too large to go with an e-mail made by Nora: the person joins it from NeoMail".into());
+    }
+    Ok(json!({ "name": name, "data": base64(bytes), "size": bytes.len() }))
 }
 
 /// What an editor answers to [`DocActionKind::ExportPdf`]: the PDF it made of the open document, `{ name, data, size }`
@@ -287,6 +319,16 @@ pub struct Card {
     pub refuse_label: Option<String>,
     /// What came of it, once answered (« Le modèle de lettre de … est maintenant … »).
     pub result: Option<String>,
+    /// What the person picks from, when the card asks for a choice rather than a yes (the mailboxes shared with them,
+    /// to write a draft from): one button each, and the card's no. Empty for a yes-or-no card.
+    pub choices: Vec<CardChoice>,
+}
+
+/// One answer a card offers ([`Card::choices`]): what the server is told (`id`) and what the button says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardChoice {
+    pub id: String,
+    pub label: String,
 }
 
 impl Card {
@@ -307,13 +349,29 @@ impl Card {
             refuse_label: text(&payload, "refuse_label"),
             // A card shared as it was made says « shared »: nothing to tell the person.
             result: text(value, "result").filter(|r| r != "shared"),
+            choices: payload
+                .get("choices")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|choice| Some(CardChoice { id: text(choice, "id")?, label: text(choice, "label")? }))
+                        .take(MAX_CARD_CHOICES)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
-    /// Whether it waits for the person's yes or no in the pane: a letter template to confirm, still pending. The
-    /// pane answers no other card: an e-mail waiting to leave is the desk's to send.
+    /// Whether it waits for the person in the pane, still pending: a letter template to confirm (yes or no), a mailbox
+    /// to write a draft from (one of its [`Card::choices`], or no). The pane answers no other card: an e-mail waiting
+    /// to leave is the desk's to send, and a mailbox card without a choice is nothing to answer.
     pub fn awaits_the_person(&self) -> bool {
-        self.kind == "Template" && self.status == "Pending"
+        self.status == "Pending" && (self.kind == "Template" || (self.kind == "Mailbox" && !self.choices.is_empty()))
+    }
+
+    /// The door the pane answers it through: [`CONFIRM_TEMPLATE`] for a template, [`ANSWER_IN_PANE`] for the others.
+    pub fn answer_path(&self) -> &'static str {
+        if self.kind == "Template" { CONFIRM_TEMPLATE } else { ANSWER_IN_PANE }
     }
 }
 
@@ -357,6 +415,9 @@ pub enum DocActionKind {
     /// Make the document's PDF and hand it to Nora ([`pdf_result`]), who joins it to an e-mail DRAFT in the
     /// person's mailbox; nothing is sent.
     ExportPdf,
+    /// Write the document in its own format, as it is now, and hand it to Nora ([`file_result`]), who joins it to an
+    /// e-mail DRAFT in the person's mailbox; nothing is sent, and nothing is saved.
+    ExportFile,
 }
 
 impl DocActionKind {
@@ -378,6 +439,7 @@ impl DocActionKind {
             DocActionKind::Undo => "Undo the last change".into(),
             DocActionKind::Print => "Print the document".into(),
             DocActionKind::ExportPdf => "Make the document's PDF".into(),
+            DocActionKind::ExportFile => "Hand over the document's file".into(),
         }
     }
 }
@@ -458,6 +520,7 @@ impl RemoteAction {
             "doc_save" => DocActionKind::Save,
             "doc_print" => DocActionKind::Print,
             "doc_export_pdf" => DocActionKind::ExportPdf,
+            "doc_export_file" => DocActionKind::ExportFile,
             _ => return unsupported("not a document action"),
         };
         RemoteAction::Doc(DocAction { callback_id, kind })
@@ -609,6 +672,48 @@ mod tests {
         assert!(!email.awaits_the_person(), "an e-mail waiting to leave is the desk's to send");
         assert!(Card::from_json(&json!({"kind": "Document"})).is_none());
         assert!(Card::from_json(&json!({"token": "c4"})).is_none());
+    }
+
+    #[test]
+    fn the_file_of_the_document_is_a_document_action_handed_in_base64_within_the_limit() {
+        let actions = parse_actions(&json!({"actions": [{"action": "doc_export_file", "callback_id": "c9"}]}));
+        assert!(matches!(&actions[0], RemoteAction::Doc(DocAction { kind: DocActionKind::ExportFile, callback_id: Some(id) }) if id == "c9"));
+        assert!(!DocActionKind::ExportFile.modifies());
+        let xlsx = b"PK\x03\x04 workbook";
+        assert_eq!(file_result("Ventes.xlsx", xlsx).unwrap(), json!({"name": "Ventes.xlsx", "data": base64(xlsx), "size": xlsx.len()}));
+        assert!(file_result("Ventes.xlsx", b"").is_err());
+        let large = vec![b'0'; MAX_FILE_BYTES + 1];
+        assert!(file_result("Ventes.xlsx", &large).is_err());
+    }
+
+    #[test]
+    fn a_mailbox_card_waits_for_one_of_its_choices_through_its_own_door() {
+        let card = Card::from_json(&json!({
+            "token": "m1", "kind": "Mailbox", "status": "Pending", "title": "Brouillon d'e-mail", "conversation_id": "t1",
+            "payload": {"summary": "Depuis quelle boîte ?", "refuse_label": "Annuler", "choices": [
+                {"id": "Bureau", "label": "Bureau (bureau@exemple.ch)"},
+                {"id": "", "label": "sans id"},
+                {"id": "Ventes"},
+                "pas un objet",
+                {"id": "Compta", "label": "Compta (compta@exemple.ch)"}
+            ]}
+        }))
+        .unwrap();
+        let ids: Vec<&str> = card.choices.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["Bureau", "Compta"], "a choice without an id or words is not one");
+        assert!(card.awaits_the_person());
+        assert_eq!(card.answer_path(), ANSWER_IN_PANE);
+        let answered = Card { status: "Executed".into(), ..card.clone() };
+        assert!(!answered.awaits_the_person());
+        let empty = Card { choices: Vec::new(), ..card };
+        assert!(!empty.awaits_the_person(), "a mailbox card without a choice is nothing to answer");
+        let template = Card::from_json(&json!({"token": "c1", "kind": "Template", "status": "Pending"})).unwrap();
+        assert_eq!(template.answer_path(), CONFIRM_TEMPLATE, "a template keeps the door every server has");
+        assert_eq!(card_choice_body("m1", "Bureau"), json!({"token": "m1", "action": "approve", "choice": "Bureau"}));
+        assert_eq!(card_refusal_body("m1"), json!({"token": "m1", "action": "reject"}));
+        let many: Vec<Value> = (0..20).map(|i| json!({"id": format!("b{i}"), "label": format!("Boîte {i}")})).collect();
+        let crowded = Card::from_json(&json!({"token": "m2", "kind": "Mailbox", "status": "Pending", "payload": {"choices": many}})).unwrap();
+        assert_eq!(crowded.choices.len(), MAX_CARD_CHOICES);
     }
 
     #[test]

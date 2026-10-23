@@ -9,8 +9,9 @@ use crate::error::NoraError;
 use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
-    self, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, card_answer_body, observation_body, observation_error, observation_ok,
-    parse_actions, parse_messages, post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of,
+    self, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, card_answer_body, card_choice_body, card_refusal_body, observation_body,
+    observation_error, observation_ok, parse_actions, parse_messages, post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body,
+    thread_id_of,
 };
 use crate::reply::instance_path;
 
@@ -87,6 +88,8 @@ pub enum Input {
     OpenLink(String),
     /// The user answered a card that waits for them ([`Card::awaits_the_person`]): yes or no.
     AnswerCard { token: String, approve: bool },
+    /// The user picked one of the choices of a card that waits for them (a mailbox to write a draft from), by its id.
+    ChooseOnCard { token: String, choice: String },
 }
 
 /// What a session asks of the host.
@@ -244,6 +247,7 @@ impl NoraSession {
             Input::Reset => self.on_reset(&mut out),
             Input::OpenLink(url) => self.on_open(&url, &mut out),
             Input::AnswerCard { token, approve } => self.on_answer_card(&token, approve, &mut out),
+            Input::ChooseOnCard { token, choice } => self.on_choose_on_card(&token, &choice, &mut out),
         }
         out
     }
@@ -738,12 +742,33 @@ impl NoraSession {
     }
 
     /// The person's yes or no on a card that waits for it, once: a second click while the answer travels does nothing.
+    /// A card that asks for a choice takes no yes without one ([`Input::ChooseOnCard`]); its no goes as any other.
     fn on_answer_card(&mut self, token: &str, approve: bool, out: &mut Vec<Output>) {
         let Some(index) = self.cards.iter().position(|shown| shown.card.token == token && shown.card.awaits_the_person() && !shown.answering) else {
             return;
         };
+        let card = &self.cards[index].card;
+        if approve && !card.choices.is_empty() {
+            return;
+        }
+        let path = card.answer_path();
+        // Through the door of the other cards, only a no: their yes is a choice.
+        let body = if path == protocol::CONFIRM_TEMPLATE { card_answer_body(token, approve) } else { card_refusal_body(token) };
         self.cards[index].answering = true;
-        let request = self.request(protocol::CONFIRM_TEMPLATE, card_answer_body(token, approve), Pending::CardAnswer(token.to_string()));
+        let request = self.request(path, body, Pending::CardAnswer(token.to_string()));
+        out.push(request);
+        out.push(Output::Changed);
+    }
+
+    /// The person's pick among a card's choices, once, and only one the card offers: the server is told its id.
+    fn on_choose_on_card(&mut self, token: &str, choice: &str, out: &mut Vec<Output>) {
+        let Some(index) = self.cards.iter().position(|shown| {
+            shown.card.token == token && shown.card.awaits_the_person() && !shown.answering && shown.card.choices.iter().any(|c| c.id == choice)
+        }) else {
+            return;
+        };
+        self.cards[index].answering = true;
+        let request = self.request(protocol::ANSWER_IN_PANE, card_choice_body(token, choice), Pending::CardAnswer(token.to_string()));
         out.push(request);
         out.push(Output::Changed);
     }
