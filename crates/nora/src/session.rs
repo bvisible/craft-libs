@@ -752,8 +752,9 @@ impl NoraSession {
             return;
         }
         let path = card.answer_path();
-        // Through the door of the other cards, only a no: their yes is a choice.
-        let body = if path == protocol::CONFIRM_TEMPLATE { card_answer_body(token, approve) } else { card_refusal_body(token) };
+        // //// Neoffice — a yes or a no, through either door: a card with choices never gets here with a yes (its yes is a
+        // //// choice, above), and an appointment card's yes is a yes (23.10.2026).
+        let body = if approve { card_answer_body(token, true) } else { card_refusal_body(token) };
         self.cards[index].answering = true;
         let request = self.request(path, body, Pending::CardAnswer(token.to_string()));
         out.push(request);

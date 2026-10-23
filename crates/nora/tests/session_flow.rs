@@ -885,6 +885,31 @@ fn a_mailbox_card_s_no_goes_through_the_pane_s_door() {
     assert!(requests(&later.handle(Input::ChooseOnCard { token: "c-box".into(), choice: "Bureau".into() })).is_empty());
 }
 
+// //// Neoffice — an appointment taken from an e-mail is put in the calendar on the person's yes (23.10.2026).
+fn event_card(status: &str) -> Value {
+    json!({"token": "c-event", "kind": "Event", "status": status, "title": "Rendez-vous", "conversation_id": "t1",
+    "payload": {"summary": "Mardi 27 octobre, 14 h, avec Ada", "confirm_label": "Ajouter à l'agenda", "refuse_label": "Annuler"}})
+}
+
+#[test]
+fn an_event_card_is_answered_yes_or_no_once_through_the_pane_s_door() {
+    let mut nora = started();
+    poll_with_cards(&mut nora, 100, json!([{"role": "assistant", "text": "Ajoutez-le sur la carte."}]), json!([event_card("Pending")]));
+    nora.handle(Input::Tick { now_ms: 5_000 });
+    assert!(nora.cards()[0].card.awaits_the_person());
+    let yes = nora.handle(Input::AnswerCard { token: "c-event".into(), approve: true });
+    let request = request_to(&yes, protocol::ANSWER_IN_PANE).clone();
+    assert_eq!(request.body, json!({"token": "c-event", "action": "approve"}));
+    assert!(requests(&nora.handle(Input::AnswerCard { token: "c-event".into(), approve: false })).is_empty(), "one answer");
+    let mut other = started();
+    poll_with_cards(&mut other, 100, json!([]), json!([event_card("Pending")]));
+    let no = other.handle(Input::AnswerCard { token: "c-event".into(), approve: false });
+    assert_eq!(request_to(&no, protocol::ANSWER_IN_PANE).body, json!({"token": "c-event", "action": "reject"}));
+    let mut later = started();
+    poll_with_cards(&mut later, 100, json!([]), json!([event_card("Executed")]));
+    assert!(requests(&later.handle(Input::AnswerCard { token: "c-event".into(), approve: true })).is_empty(), "done");
+}
+
 #[test]
 fn the_document_s_file_is_handed_without_a_question() {
     let mut nora = started();

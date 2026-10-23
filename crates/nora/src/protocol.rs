@@ -362,11 +362,12 @@ impl Card {
         })
     }
 
-    /// Whether it waits for the person in the pane, still pending: a letter template to confirm (yes or no), a mailbox
-    /// to write a draft from (one of its [`Card::choices`], or no). The pane answers no other card: an e-mail waiting
-    /// to leave is the desk's to send, and a mailbox card without a choice is nothing to answer.
+    /// Whether it waits for the person in the pane, still pending: a letter template to confirm (yes or no), an
+    /// appointment to put in their calendar (yes or no: an `Event` card, made from an e-mail), a mailbox to write a draft
+    /// from (one of its [`Card::choices`], or no). The pane answers no other card: an e-mail waiting to leave is the
+    /// desk's to send, and a mailbox card without a choice is nothing to answer.
     pub fn awaits_the_person(&self) -> bool {
-        self.status == "Pending" && (self.kind == "Template" || (self.kind == "Mailbox" && !self.choices.is_empty()))
+        self.status == "Pending" && (self.kind == "Template" || self.kind == "Event" || (self.kind == "Mailbox" && !self.choices.is_empty()))
     }
 
     /// The door the pane answers it through: [`CONFIRM_TEMPLATE`] for a template, [`ANSWER_IN_PANE`] for the others.
@@ -709,6 +710,12 @@ mod tests {
         assert!(!empty.awaits_the_person(), "a mailbox card without a choice is nothing to answer");
         let template = Card::from_json(&json!({"token": "c1", "kind": "Template", "status": "Pending"})).unwrap();
         assert_eq!(template.answer_path(), CONFIRM_TEMPLATE, "a template keeps the door every server has");
+        // //// Neoffice — an appointment taken from an e-mail (23.10.2026): yes or no, through the pane's door.
+        let event = Card::from_json(&json!({"token": "e1", "kind": "Event", "status": "Pending", "payload": {"confirm_label": "Ajouter"}})).unwrap();
+        assert!(event.awaits_the_person() && event.choices.is_empty());
+        assert_eq!(event.answer_path(), ANSWER_IN_PANE);
+        let added = Card { status: "Executed".into(), ..event };
+        assert!(!added.awaits_the_person());
         assert_eq!(card_choice_body("m1", "Bureau"), json!({"token": "m1", "action": "approve", "choice": "Bureau"}));
         assert_eq!(card_refusal_body("m1"), json!({"token": "m1", "action": "reject"}));
         let many: Vec<Value> = (0..20).map(|i| json!({"id": format!("b{i}"), "label": format!("Boîte {i}")})).collect();
