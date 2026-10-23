@@ -15,7 +15,7 @@
 //! lead to the instance apart), no picture, no HTML (shown as text), no table. A marker of emphasis or
 //! code that is not closed stays as written.
 
-use egui::text::{LayoutJob, TextFormat};
+use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontId};
 
 /// How a piece of a reply is drawn.
@@ -83,8 +83,21 @@ pub(crate) enum Bold {
 
 /// The pieces laid out for egui: `base` for the words, `bold` for the bold ones, `code_bg` the background of code.
 pub(crate) fn job(text: &str, base: &TextFormat, bold: &Bold, code_bg: Color32) -> LayoutJob {
+    laid_out(&pieces(text), base, bold, code_bg, false)
+}
+
+/// The layout of [`job`] with [`Bold::Doubled`], every word but the bold ones transparent and no background: drawn
+/// over the reply a pixel to the right, it thickens the bold words alone. `None` when nothing is bold.
+pub(crate) fn bold_overlay(text: &str, base: &TextFormat) -> Option<LayoutJob> {
+    let pieces = pieces(text);
+    pieces.iter().any(|piece| piece.look.bold).then(|| laid_out(&pieces, base, &Bold::Doubled, Color32::TRANSPARENT, true))
+}
+
+/// One section per piece, never merged with the next as `LayoutJob::append` merges two of the same format: egui
+/// shapes each section on its own, so the reply and its overlay, cut at the same places, are laid out alike.
+fn laid_out(pieces: &[Piece], base: &TextFormat, bold: &Bold, code_bg: Color32, only_bold: bool) -> LayoutJob {
     let mut job = LayoutJob::default();
-    for piece in pieces(text) {
+    for piece in pieces.iter().filter(|piece| !piece.text.is_empty()) {
         let mut format = base.clone();
         if piece.look.bold
             && let Bold::Font(font) = bold
@@ -95,29 +108,14 @@ pub(crate) fn job(text: &str, base: &TextFormat, bold: &Bold, code_bg: Color32) 
         if piece.look.code {
             format.background = code_bg;
         }
-        job.append(&piece.text, 0.0, format);
-    }
-    job
-}
-
-/// The layout of [`job`] with [`Bold::Doubled`], every word but the bold ones transparent and no background: drawn
-/// over the reply a pixel to the right, it thickens the bold words alone. `None` when nothing is bold.
-pub(crate) fn bold_overlay(text: &str, base: &TextFormat) -> Option<LayoutJob> {
-    let pieces = pieces(text);
-    if !pieces.iter().any(|piece| piece.look.bold) {
-        return None;
-    }
-    let mut job = LayoutJob::default();
-    for piece in pieces {
-        let mut format = base.clone();
-        format.italics = piece.look.italic;
-        format.background = Color32::TRANSPARENT;
-        if !piece.look.bold {
+        if only_bold && !piece.look.bold {
             format.color = Color32::TRANSPARENT;
         }
-        job.append(&piece.text, 0.0, format);
+        let start = job.text.len();
+        job.text.push_str(&piece.text);
+        job.sections.push(LayoutSection { leading_space: 0.0, byte_range: ByteIndex(start)..ByteIndex(job.text.len()), format });
     }
-    Some(job)
+    job
 }
 
 /// The words of a heading line (`# Title`), when it is one.
@@ -295,12 +293,17 @@ mod tests {
     #[test]
     fn the_layout_keeps_every_word_once() {
         let base = TextFormat::simple(FontId::proportional(14.0), Color32::BLACK);
-        let job = job("**Total** : 42\n- un", &base, &Bold::Font(FontId::new(14.0, egui::FontFamily::Name("bold".into()))), Color32::GRAY);
-        assert_eq!(job.text, "Total : 42\n• un");
-        assert_eq!(job.sections.len(), 2);
-        assert_eq!(job.sections[0].format.font_id.family, egui::FontFamily::Name("bold".into()));
-        let job = job("**Total**", &base, &Bold::Doubled, Color32::GRAY);
-        assert_eq!(job.sections[0].format, base, "no bold family: the regular one, drawn twice by the pane");
+        let laid = job("**Total** : 42\n- un", &base, &Bold::Font(FontId::new(14.0, egui::FontFamily::Name("bold".into()))), Color32::GRAY);
+        assert_eq!(laid.text, "Total : 42\n• un");
+        let bold: Vec<&str> = laid
+            .sections
+            .iter()
+            .filter(|section| section.format.font_id.family == egui::FontFamily::Name("bold".into()))
+            .map(|section| &laid.text[section.byte_range.start.0..section.byte_range.end.0])
+            .collect();
+        assert_eq!(bold, ["Total"], "the bold word alone in the bold family");
+        let laid = job("**Total**", &base, &Bold::Doubled, Color32::GRAY);
+        assert_eq!(laid.sections[0].format, base, "no bold family: the regular one, drawn twice by the pane");
         assert_eq!(plain("[**Ouvrir**]"), "[Ouvrir]");
     }
 
@@ -317,8 +320,12 @@ mod tests {
             assert_eq!((&over.format.font_id, over.format.italics), (&under.format.font_id, under.format.italics), "laid out alike");
             assert_eq!(over.format.background, Color32::TRANSPARENT, "the code background is not drawn twice");
         }
-        let seen: Vec<&str> =
-            overlay.sections.iter().filter(|s| s.format.color != Color32::TRANSPARENT).map(|s| &overlay.text[s.byte_range.clone()]).collect();
+        let seen: Vec<&str> = overlay
+            .sections
+            .iter()
+            .filter(|s| s.format.color != Color32::TRANSPARENT)
+            .map(|s| &overlay.text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
         assert_eq!(seen, ["Régie Exemple Sàrl", "Suite"], "only the bold words and the heading");
         assert!(bold_overlay("rien de gras, *penché*", &base).is_none());
     }
