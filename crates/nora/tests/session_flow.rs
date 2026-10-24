@@ -1620,3 +1620,43 @@ fn a_late_answer_whose_write_was_refused_is_corrected() {
     poll(&mut nora, 510_200, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_496.0}]), json!([]));
     assert_eq!(nora.correction(1), Some(Correction::NothingDone));
 }
+
+/// A long action of Nora's (an OCR, a big file made smaller, a long calculation in a workbook) holds the page 90 s: no
+/// frame meanwhile, and the action Nora queued while it ran waited that long. The editor finished it, so the page was
+/// alive: nothing is refused, nothing is offered to resume, the turn goes on (24.10, NeoPDF's review). The host may
+/// tick before or after it hands the result over.
+#[test]
+fn a_long_action_is_no_freeze() {
+    for result_first in [true, false] {
+        let mut nora = started_at(1_000.0);
+        let ocr = json!({"action": "doc_execute", "command": "ocr.run", "params": {}, "callback_id": "c1"});
+        let started = poll_queue(&mut nora, 100, json!({"actions": [ocr], "queued_at": [1_001.0], "now": 1_001.5}));
+        let ocr_id = documents(&started)[0].id;
+        // Ninety seconds in the editor's action, no frame meanwhile; Nora queues the next one at once.
+        let next = json!({"action": "doc_type_text", "text": "42", "callback_id": "c2"});
+        let queue = json!({"success": true, "actions": [next], "queued_at": [1_002.0], "now": 1_092.0});
+        let outputs = if result_first {
+            nora.handle(Input::DocumentResult { id: ocr_id, result: Ok(json!({"ok": true})) });
+            poll_queue(&mut nora, 90_100, queue)
+        } else {
+            let read = nora.handle(Input::Tick { now_ms: 90_100 });
+            nora.handle(Input::DocumentResult { id: ocr_id, result: Ok(json!({"ok": true})) });
+            nora.handle(ok(request_to(&read, protocol::GET_MESSAGES), json!({"success": true, "messages": [], "cards": []})));
+            nora.handle(ok(request_to(&read, protocol::GET_ACTIONS), queue))
+        };
+        assert_eq!(documents(&outputs).len(), 1, "the next action runs (result first: {result_first})");
+        poll(&mut nora, 93_200, json!([{"role": "assistant", "text": "Le texte est reconnu et 42 est écrit.", "ts": 1_093.0}]), json!([]));
+        let played = documents(&outputs)[0].id;
+        nora.handle(Input::DocumentResult { id: played, result: Ok(json!({"ok": true})) });
+        nora.handle(Input::Tick { now_ms: 96_000 });
+        assert!(!nora.is_busy() && nora.last_error().is_none());
+        assert_eq!(nora.resumable(), None, "nothing to resume");
+        assert_eq!(nora.transcript()[1].text, "Le texte est reconnu et 42 est écrit.");
+        assert_eq!(nora.correction(1), None, "the reply is shown as it is");
+    }
+    // The same silence with no action at work is a freeze, as before.
+    let mut idle = started_at(1_000.0);
+    poll(&mut idle, 100, json!([]), json!([]));
+    let late = poll_queue(&mut idle, 90_100, json!({"actions": [type_text("c3")], "queued_at": [1_002.0], "now": 1_092.0}));
+    assert!(documents(&late).is_empty() && refused_with(&late, "c3").contains("background"));
+}

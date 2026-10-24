@@ -282,6 +282,12 @@ pub struct NoraSession {
     /// asleep): kept by the pane itself until the turn ends, and every action of the turn read after it is refused,
     /// whatever the server says of when it was queued (a server older than its times, a fake one, says nothing).
     frozen_seen: bool,
+    /// An action of Nora's finished since the last tick: the page was alive, whatever the time between two ticks.
+    action_done: bool,
+    /// The time the page spent in Nora's actions (an OCR, a big file made smaller, a long calculation) since the action
+    /// queue was last judged: an action that waited that long in the queue waited on the editor at work, not on a page
+    /// that ran nothing.
+    action_allowance_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -339,6 +345,8 @@ impl NoraSession {
             work_open: false,
             turn_marks: HashMap::new(),
             frozen_seen: false,
+            action_done: false,
+            action_allowance_ms: 0,
         }
     }
 
@@ -512,6 +520,7 @@ impl NoraSession {
         self.final_seen_ms = None;
         self.work_open = false;
         self.frozen_seen = false;
+        self.action_allowance_ms = 0;
         let request = match self.thread_id.clone() {
             Some(thread) => self.request(protocol::POST_MESSAGE, post_message_body(&thread, &text, &self.context), Pending::Send),
             None => self.request(protocol::START_OR_RESUME_THREAD, start_thread_body(&text, &self.context), Pending::Send),
@@ -522,9 +531,14 @@ impl NoraSession {
 
     fn on_tick(&mut self, now_ms: u64, out: &mut Vec<Output>) {
         // A page that drew no frame for `frozen_ms` while Nora worked ran nothing she asked meanwhile.
+        // Only a silence of the page with no action of Nora's at work is one: an action that holds the page (an OCR, a
+        // big file made smaller, a long calculation) and that the editor finishes proves the page was alive.
         let mut thawing = false;
         if self.busy || self.late_until_ms.is_some() {
-            if self.watch_ms.is_some_and(|last| now_ms.saturating_sub(last) >= self.cfg.frozen_ms) {
+            let gap = self.watch_ms.map_or(0, |last| now_ms.saturating_sub(last));
+            if self.action_done || !self.running.is_empty() {
+                self.action_allowance_ms = self.action_allowance_ms.saturating_add(gap);
+            } else if self.watch_ms.is_some() && gap >= self.cfg.frozen_ms {
                 self.thaw_ms = Some(now_ms);
                 thawing = true;
                 self.frozen_seen |= self.busy;
@@ -533,6 +547,7 @@ impl NoraSession {
         } else {
             self.watch_ms = None;
         }
+        self.action_done = false;
         self.now_ms = now_ms;
         if !self.busy {
             self.read_late(now_ms, out);
@@ -927,12 +942,14 @@ impl NoraSession {
             self.turn_marks.entry(self.turn_index).or_default().refused = true;
         }
         let limit = self.cfg.frozen_ms as f64 / 1000.0;
+        // The time the editor spent in Nora's actions meanwhile is no wait on a page that ran nothing.
+        let at_work = std::mem::take(&mut self.action_allowance_ms) as f64 / 1000.0;
         let count = parse_actions(message).len();
         let waited: Vec<bool> = (0..count)
             .map(|index| {
                 read_before_thaw
                     || match (queued.get(index).copied().flatten(), server_now) {
-                        (Some(at), Some(now)) => now - at >= limit,
+                        (Some(at), Some(now)) => now - at - at_work >= limit,
                         _ => thawed.is_some(),
                     }
             })
@@ -1108,6 +1125,7 @@ impl NoraSession {
         let Some(run) = self.running.remove(&id) else {
             return;
         };
+        self.action_done = true;
         self.last_activity_ms = self.now_ms;
         let observation = match result {
             Ok(value) => {
@@ -1167,6 +1185,7 @@ impl NoraSession {
         self.final_seen_ms = None;
         self.work_open = false;
         self.frozen_seen = false;
+        self.action_allowance_ms = 0;
         self.next_poll_ms = None;
         self.inflight.clear();
         self.running.clear();
