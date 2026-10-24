@@ -293,6 +293,26 @@ pub fn missed_of(message: &Value) -> Option<f64> {
     message.get("missed").and_then(Value::as_f64)
 }
 
+/// To whom the server addressed one action of the queue: the conversation, which is one pane's thread (`for_thread`),
+/// and the Drive file of that conversation's document (`for_document`), as its page context names it. A person with two
+/// editors open holds two conversations at once, and an action addressed to the other's is refused
+/// ([`crate::NoraSession`]). An action the server did not address (a server older than 24.10) has neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Addressee {
+    pub thread: Option<String>,
+    pub document: Option<String>,
+}
+
+/// The addressee of each action in the answer of `get_browser_actions`, in the order of [`parse_actions`].
+pub fn addressees_of(message: &Value) -> Vec<Addressee> {
+    let text = |action: &Value, key: &str| action.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string);
+    message
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().map(|action| Addressee { thread: text(action, "for_thread"), document: text(action, "for_document") }).collect())
+        .unwrap_or_default()
+}
+
 /// The server time at which the action queue of `get_browser_actions` was last filled.
 pub fn queued_at_of(message: &Value) -> Option<f64> {
     message.get("timestamp").and_then(Value::as_f64)
@@ -578,6 +598,21 @@ mod tests {
         assert_eq!((replies[2].role, replies[2].text.as_str()), (Role::Other, ""));
         assert_eq!(cards.len(), 1);
         assert_eq!(parse_messages(&json!({})), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn each_action_says_to_whom_it_is_addressed() {
+        let message = json!({"actions": [
+            {"action": "doc_observe", "callback_id": "c1", "for_thread": "t1", "for_document": "f1"},
+            {"action": "doc_save", "callback_id": "c2", "for_thread": "t1", "for_document": null},
+            {"action": "doc_save", "callback_id": "c3"},
+            {"action": "doc_save", "callback_id": "c4", "for_thread": "", "for_document": 7}
+        ]});
+        let to =
+            |thread: Option<&str>, document: Option<&str>| Addressee { thread: thread.map(str::to_string), document: document.map(str::to_string) };
+        assert_eq!(addressees_of(&message), vec![to(Some("t1"), Some("f1")), to(Some("t1"), None), to(None, None), to(None, None)]);
+        assert_eq!(addressees_of(&message).len(), parse_actions(&message).len());
+        assert!(addressees_of(&json!({"success": true})).is_empty());
     }
 
     #[test]

@@ -9,9 +9,9 @@ use crate::error::NoraError;
 use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
-    self, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, card_answer_body, card_choice_body, card_refusal_body, missed_of,
-    observation_body, observation_error, observation_ok, parse_actions, parse_messages, post_message_body, queued_at_of, sent_at_of,
-    start_thread_body, thread_body, thread_id_of, waits_of,
+    self, Addressee, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, addressees_of, card_answer_body, card_choice_body,
+    card_refusal_body, missed_of, observation_body, observation_error, observation_ok, parse_actions, parse_messages, post_message_body,
+    queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of, waits_of,
 };
 use crate::reply::instance_path;
 
@@ -33,6 +33,12 @@ in the document";
 const FROZEN: &str = "the person's tab was in the background, so the editor could not run this in time: nothing was done \
 in the document. Do not try again in this turn: tell the person in one sentence that nothing was changed; their pane \
 offers to resume the request";
+
+/// What Nora is told about an action addressed to another pane or another document than this pane's (the person may
+/// have two editors open, each with its conversation): nothing is done here, whatever queue it was found in.
+const ELSEWHERE: &str = "this action was addressed to another document than the one open in this pane (the person may \
+have another editor open, with its own conversation): nothing was done. Do not retry it: tell the person in one sentence that \
+nothing was changed";
 
 /// How long past the silence a read the host never answers is waited for, before the turn is given up on anyway: more
 /// than the hosts' own limit on a call (180 s in the Drive's page, 200 s in NeoMail).
@@ -660,8 +666,11 @@ impl NoraSession {
                 let given_up = !self.busy;
                 let waited = self.waited_too_long(&message);
                 let earlier = self.of_an_earlier_turn(&message);
-                for ((action, too_long), earlier) in parse_actions(&message).into_iter().zip(waited).zip(earlier) {
-                    if stale {
+                let addressees = addressees_of(&message);
+                for (((action, too_long), earlier), to) in parse_actions(&message).into_iter().zip(waited).zip(earlier).zip(addressees) {
+                    if !self.addressed_here(&to) {
+                        self.refuse(action, ELSEWHERE, out);
+                    } else if stale {
                         self.refuse(action, STOPPED, out);
                     } else if given_up {
                         self.refuse(action, LATE, out);
@@ -850,6 +859,17 @@ impl NoraSession {
             self.abandoned = true;
         }
         waited
+    }
+
+    /// Whether an action is addressed to this pane, when the server said to whom: to its conversation, and to the Drive
+    /// file of its document as its page context names it. The server addresses an action to the turn's conversation
+    /// apart from the queue it puts it in, so an action ever queued in this conversation for another (the person's other
+    /// editor) is refused here ([`ELSEWHERE`]) rather than played in this document, a write above all; so is one for a
+    /// file this pane does not name (a document of the computer, in NeoDesk).
+    fn addressed_here(&self, to: &Addressee) -> bool {
+        let thread = to.thread.as_deref().is_none_or(|thread| self.thread_id.as_deref() == Some(thread));
+        let document = to.document.as_deref().is_none_or(|document| self.context.document.id.as_deref() == Some(document));
+        thread && document
     }
 
     /// For each action of a read of the queue, once a turn of this conversation was given up on or lost, whether it

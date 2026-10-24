@@ -1390,3 +1390,66 @@ fn back_from_a_gap_the_answers_that_waited_in_the_page_are_read_before_anything_
     let refused = reading.handle(ok(&queue, json!({"success": true, "actions": [type_text("c1")]})));
     assert!(documents(&refused).is_empty());
 }
+
+/// A session showing a Drive file, whose first message got its thread id `t1`.
+fn started_on_file(id: &str) -> NoraSession {
+    let mut document = DocumentInfo::named("lettre.docx");
+    document.id = DocumentInfo::file_id(id);
+    let mut nora = NoraSession::new(SessionConfig::default(), PageContext::editor(AppKind::Word, document));
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    let start = request_to(&sent, protocol::START_OR_RESUME_THREAD).clone();
+    nora.handle(ok(&start, json!({"thread_id": "t1"})));
+    nora
+}
+
+fn elsewhere(outputs: &[Output], callback: &str) -> bool {
+    refusal_of(outputs, callback).as_str().is_some_and(|why| why.contains("addressed to another document"))
+}
+
+/// A person with two editors open (NeoDoc in one tab, NeoGrille in another) holds two conversations at once. On 24.10 a
+/// NeoDoc turn read the workbook of the other tab: the server took the person's latest conversation. Whatever queue an
+/// action is found in, a pane runs only what is addressed to its own conversation; a write addressed elsewhere is never
+/// played in its document.
+#[test]
+fn an_action_addressed_to_another_pane_is_refused_and_never_runs() {
+    let mut nora = started();
+    let write = json!({"action": "doc_execute", "command": "format.bold", "params": {}, "callback_id": "w1", "for_thread": "t2"});
+    let read = json!({"action": "doc_observe", "callback_id": "r1", "for_thread": "t2"});
+    let outputs = poll(&mut nora, 100, json!([]), json!([write, read]));
+    assert!(documents(&outputs).is_empty(), "nothing is played in this document");
+    assert!(elsewhere(&outputs, "w1") && elsewhere(&outputs, "r1"));
+    assert!(!nora.can_undo());
+    // The same turn's action addressed to this pane runs.
+    let mine = json!({"action": "doc_observe", "callback_id": "r2", "for_thread": "t1"});
+    let outputs = poll(&mut nora, 1_000, json!([]), json!([mine]));
+    assert_eq!(documents(&outputs).len(), 1);
+}
+
+#[test]
+fn an_action_for_another_document_is_refused_and_one_for_this_document_runs() {
+    let mut nora = started_on_file("20795bd915");
+    let other = json!({"action": "doc_execute", "command": "format.bold", "params": {}, "callback_id": "w1",
+        "for_thread": "t1", "for_document": "0b0844c613"});
+    let outputs = poll(&mut nora, 100, json!([]), json!([other]));
+    assert!(documents(&outputs).is_empty() && elsewhere(&outputs, "w1"));
+    let mine = json!({"action": "doc_observe", "callback_id": "r1", "for_thread": "t1", "for_document": "20795bd915"});
+    let outputs = poll(&mut nora, 1_000, json!([]), json!([mine]));
+    assert_eq!(documents(&outputs).len(), 1);
+}
+
+/// A pane that shows no Drive file (a document of the computer, in NeoDesk) never runs an action addressed to a file.
+#[test]
+fn a_pane_without_a_file_refuses_an_action_addressed_to_one() {
+    let mut nora = started();
+    let read = json!({"action": "doc_observe", "callback_id": "r1", "for_thread": "t1", "for_document": "20795bd915"});
+    let outputs = poll(&mut nora, 100, json!([]), json!([read]));
+    assert!(documents(&outputs).is_empty() && elsewhere(&outputs, "r1"));
+}
+
+/// An action the server did not address (a server older than 24.10) runs as before; the server addresses each one now.
+#[test]
+fn an_action_without_an_address_runs_as_before() {
+    let mut nora = started_on_file("20795bd915");
+    let outputs = poll(&mut nora, 100, json!([]), json!([{"action": "doc_observe", "callback_id": "r1"}]));
+    assert_eq!(documents(&outputs).len(), 1);
+}
