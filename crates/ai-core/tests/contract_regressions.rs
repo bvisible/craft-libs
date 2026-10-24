@@ -16,7 +16,7 @@ fn models(id: &str) -> Vec<ModelInfo> {
 #[test]
 fn new_draft_discards_models_when_address_changes_after_probe() {
     let mut draft = draft("https://a.example/v1");
-    draft.set_models(models("a-only"));
+    assert!(draft.set_models("https://a.example/v1", models("a-only")));
     draft.endpoint = "https://b.example/v1".into();
     assert!(draft.prepare(&[]).unwrap().connection.models.is_empty());
 }
@@ -26,7 +26,7 @@ fn returning_to_original_address_does_not_keep_another_addresses_models() {
     let saved = draft("https://a.example/v1").prepare(&[]).unwrap().connection;
     let mut draft = ConnectionDraft::from_connection(&saved);
     draft.endpoint = "https://b.example/v1".into();
-    draft.set_models(models("b-only"));
+    assert!(draft.set_models("https://b.example/v1", models("b-only")));
     draft.endpoint = "https://a.example/v1".into();
     assert!(draft.prepare(&[saved]).unwrap().connection.models.is_empty());
 }
@@ -56,7 +56,7 @@ fn a_fresh_test_at_each_address_keeps_its_models() {
     let mut draft = ConnectionDraft::from_connection(&saved);
     for address in ["https://b.example/v1", "https://a.example/v1", "https://c.example/v1"] {
         draft.endpoint = format!("  {address}  ");
-        draft.set_models(models("same-model"));
+        assert!(draft.set_models(address, models("same-model")));
         assert_eq!(draft.prepare(std::slice::from_ref(&saved)).unwrap().connection.models, models("same-model"));
     }
 }
@@ -132,4 +132,67 @@ fn required_inputs_resolve_when_supplied_and_optional_inputs_need_not_be_sent() 
     connection.models[0].capabilities[0].requires = vec![InputRole::Source];
     assert!(fits(&role, &connection.models[0]).is_some());
     assert!(resolve(&role, &[&[binding]], &[connection]).is_ok());
+}
+
+#[test]
+fn a_test_that_answers_after_the_address_moved_on_is_dropped() {
+    let mut draft = draft("https://a.example/v1");
+    // The test is started against a.example; the address is edited while it runs.
+    draft.endpoint = "https://b.example/v1".into();
+    assert!(!draft.set_models("https://a.example/v1", models("a-only")), "a late answer is not taken");
+    assert!(draft.models.is_empty(), "and it leaves the form's models alone");
+    assert!(draft.prepare(&[]).unwrap().connection.models.is_empty());
+}
+
+#[test]
+fn a_test_that_answers_while_its_address_still_stands_is_taken() {
+    let mut draft = draft("https://a.example/v1");
+    assert!(draft.set_models("  https://a.example/v1  ", models("a-only")), "whitespace is not a different address");
+    assert_eq!(draft.prepare(&[]).unwrap().connection.models, models("a-only"));
+}
+
+#[test]
+fn a_late_answer_does_not_overwrite_the_newer_address_own_models() {
+    let mut draft = draft("https://a.example/v1");
+    draft.endpoint = "https://b.example/v1".into();
+    // The test at b.example answers first; the older one at a.example arrives afterwards.
+    assert!(draft.set_models("https://b.example/v1", models("b-only")));
+    assert!(!draft.set_models("https://a.example/v1", models("a-only")));
+    assert_eq!(draft.prepare(&[]).unwrap().connection.models, models("b-only"), "the newer answer stands");
+}
+
+#[test]
+fn an_answer_is_judged_by_its_address_not_by_how_long_it_waited() {
+    // Identity here is the address, not the test. After a.example → b.example → a.example, an
+    // answer from the first test at a.example is still taken: the field holds a.example and those
+    // models do belong to it. What must never happen is b.example's models being filed under
+    // a.example, which is checked below.
+    let mut draft = draft("https://a.example/v1");
+    draft.endpoint = "https://b.example/v1".into();
+    assert!(draft.set_models("https://b.example/v1", models("b-only")));
+    draft.endpoint = "https://a.example/v1".into();
+    assert!(draft.prepare(&[]).unwrap().connection.models.is_empty(), "b.example's models are not saved under a.example");
+    assert!(draft.set_models("https://a.example/v1", models("a-only")), "an answer for the address on the form is taken");
+    assert_eq!(draft.prepare(&[]).unwrap().connection.models, models("a-only"));
+}
+
+#[test]
+fn a_refused_answer_leaves_models_already_on_the_form_untouched() {
+    let mut draft = draft("https://a.example/v1");
+    assert!(draft.set_models("https://a.example/v1", models("a-only")));
+    draft.endpoint = "https://b.example/v1".into();
+    assert!(!draft.set_models("https://a.example/v1", models("a-stale")));
+    assert_eq!(draft.models, models("a-only"), "the refused set is not written over the form");
+}
+
+#[test]
+fn an_address_differing_only_in_case_or_a_trailing_slash_is_a_different_address() {
+    // The comparison is on the field's text, not a parsed URL: Endpoint drops the path, so
+    // /v1 and /v2 would look equal through it. Differing the other way is safe — the answer is
+    // refused and the person tests again — so this pins which way it fails.
+    for other in ["https://A.Example/v1", "https://a.example/v1/", "https://a.example/v2"] {
+        let mut draft = draft("https://a.example/v1");
+        assert!(!draft.set_models(other, models("x")), "{other} is not the field's address");
+        assert!(draft.models.is_empty());
+    }
 }

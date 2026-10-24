@@ -24,6 +24,25 @@ pub type KrillaResult<T> = Result<T, KrillaError>;
 pub enum KrillaError {
     /// A page or surface failed during cleanup; discard the complete document.
     Poisoned,
+    /// [`GroupColorSpace::Cmyk`] with `no_device_cs` needs a `cmyk_profile` for the group
+    /// color space.
+    ///
+    /// [`GroupColorSpace::Cmyk`]: crate::GroupColorSpace::Cmyk
+    MissingGroupCmykProfile,
+    /// A mesh gradient's corner colors are in color spaces that can't be written as one
+    /// (see [`MeshGradient`]), for example RGB with CMYK.
+    ///
+    /// [`MeshGradient`]: crate::paint::MeshGradient
+    MixedMeshColorSpaces(Option<Location>),
+    /// [`Surface::start_optional_content`] was given an [`OcgId`] that this document did
+    /// not create.
+    ///
+    /// [`Surface::start_optional_content`]: crate::surface::Surface::start_optional_content
+    /// [`OcgId`]: crate::optional_content::OcgId
+    UnknownOptionalContentGroup(Option<Location>),
+    /// Optional content marks were not balanced: an end without a start, a mark still open
+    /// when its stream finished, or a mark overlapping a tagged section.
+    UnbalancedOptionalContent(Option<Location>),
     /// An error while attempting to embed a font.
     Font(Font, String),
     /// A list of validation errors. Can only occur if you set the `validator` in
@@ -62,6 +81,21 @@ impl Display for KrillaError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             KrillaError::Poisoned => f.write_str("document contains a failed page or surface"),
+            KrillaError::MissingGroupCmykProfile => {
+                f.write_str("a CMYK group color space with no_device_cs needs a CMYK profile")
+            }
+            KrillaError::MixedMeshColorSpaces(location) => {
+                f.write_str("a mesh gradient mixes color spaces that can't be written as one")?;
+                write_location(f, *location)
+            }
+            KrillaError::UnknownOptionalContentGroup(location) => {
+                f.write_str("an optional content group from another document was used")?;
+                write_location(f, *location)
+            }
+            KrillaError::UnbalancedOptionalContent(location) => {
+                f.write_str("optional content marks are not balanced")?;
+                write_location(f, *location)
+            }
             KrillaError::Font(_, message) => write!(f, "failed to embed font: {message}"),
             KrillaError::Validation(errors) => {
                 let count = errors.len();

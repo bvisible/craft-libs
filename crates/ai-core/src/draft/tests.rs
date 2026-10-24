@@ -180,7 +180,7 @@ fn models_found_at_the_new_address_are_kept() {
     let found = vec![ModelInfo::new(crate::ids::ModelId::new("llama-x").unwrap(), "Llama X")];
     let mut moved = ConnectionDraft::from_connection(&saved);
     moved.endpoint = "https://other.example.com/v1".into();
-    moved.set_models(found.clone());
+    assert!(moved.set_models("https://other.example.com/v1", found.clone()));
     assert_eq!(moved.prepare(std::slice::from_ref(&saved)).unwrap().connection.models, found);
 }
 
@@ -189,7 +189,7 @@ fn a_retest_that_finds_the_same_models_keeps_them() {
     let saved = saved_openai();
     let mut moved = ConnectionDraft::from_connection(&saved);
     moved.endpoint = "https://other.example.com/v1".into();
-    moved.set_models(saved.models.clone());
+    assert!(moved.set_models("https://other.example.com/v1", saved.models.clone()));
     assert_eq!(moved.prepare(std::slice::from_ref(&saved)).unwrap().connection.models, saved.models);
 }
 
@@ -198,7 +198,8 @@ fn models_found_before_the_address_changed_are_dropped() {
     let saved = saved_openai();
     let found = vec![ModelInfo::new(crate::ids::ModelId::new("llama-x").unwrap(), "Llama X")];
     let mut d = ConnectionDraft::from_connection(&saved);
-    d.set_models(found);
+    let at = d.endpoint.clone();
+    assert!(d.set_models(&at, found));
     d.endpoint = "https://other.example.com/v1".into();
     assert!(d.prepare(std::slice::from_ref(&saved)).unwrap().connection.models.is_empty());
 }

@@ -120,6 +120,15 @@ pub struct InterpreterSettings {
     /// costs a decode and a resample each for pixels nobody can see. Never set it for a final
     /// render (tiles, whole pages, print, export).
     pub preview: bool,
+    /// PdfCraft patch (35): draw one ink's separation instead of the composite page (see
+    /// [`Plate`](crate::color::Plate)). Soft masks still draw in colour: a mask's luminosity
+    /// comes from its group's colours, not from the page's plate (a DeviceCMYK luminosity
+    /// mask's from its own process plates, see `SoftMask::plate`). Patch 36: the plate's
+    /// `simulation` converts process colour to an output intent's CMYK.
+    pub plate: Option<crate::color::Plate>,
+    /// PdfCraft patch (35): told about each spot ink a paint uses (colours, images, shadings
+    /// and uncoloured patterns), whether or not `plate` is set.
+    pub ink_sink: Option<crate::color::InkSinkFn>,
 }
 
 impl Default for InterpreterSettings {
@@ -142,6 +151,8 @@ impl Default for InterpreterSettings {
             ocg_overrides: Arc::new(Vec::new()),
             cancelled: None,
             preview: false,
+            plate: None,
+            ink_sink: None,
         }
     }
 }
@@ -175,6 +186,9 @@ pub fn interpret_page<'a>(
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
+        // PdfCraft patch (29): bracket the annotations so devices can tell their paints from
+        // the document's own (the reading-colours setting recolours the document, not comments).
+        device.begin_annotations();
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
 
@@ -275,6 +289,7 @@ pub fn interpret_page<'a>(
                 draw_highlight_without_appearance(&annot, context, device);
             }
         }
+        device.end_annotations();
     }
 }
 
@@ -555,11 +570,9 @@ fn interpret_window<'a>(
             }
             TypedInstruction::DashPattern(p) => {
                 context.get_mut().graphics_state.stroke_props.dash_offset = p.1.as_f32();
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
+                // PdfCraft patch: bounded, see `types::dash_array`.
                 context.get_mut().graphics_state.stroke_props.dash_array =
-                    p.0.iter::<f32>()
-                        .map(|n| if n == 0.0 { 0.01 } else { n })
-                        .collect();
+                    crate::types::dash_array(p.0.iter::<f32>());
             }
             TypedInstruction::RenderingIntent(_) => {
                 // Ignore for now.

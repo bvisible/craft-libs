@@ -10,7 +10,8 @@
 //!   newline would otherwise reach an HTTP header.
 //! - **Editing keeps what was not touched.** Leaving the key box empty keeps the saved key; the
 //!   models saved with a connection are dropped when the address changes, because they belong to
-//!   the old one. Models found by a test at the new address are kept.
+//!   the old one. Models found by a test at the new address are kept, and a test that answers
+//!   after the address moved on is dropped rather than credited to the address it finds.
 //! - **Messages are for people.** Every [`DraftError`] names the field and says what to do, and
 //!   never contains the key.
 //!
@@ -244,8 +245,9 @@ pub struct ConnectionDraft {
     /// Header that carries the key; empty sends it as `Authorization: Bearer`.
     pub key_header: String,
     pub enabled: bool,
-    /// Models carried onto the saved connection. Use [`set_models`](Self::set_models) when
-    /// replacing models after an address change so their address is recorded.
+    /// Models carried onto the saved connection. Assigning here declares them by hand and records
+    /// no address, so they survive any address change; models a test found go through
+    /// [`set_models`](Self::set_models), which records where they came from.
     pub models: Vec<ModelInfo>,
     /// Editing: the saved key's locator, and whether a key was saved at all.
     secret: Option<SecretRef>,
@@ -316,15 +318,31 @@ impl ConnectionDraft {
             enabled: c.enabled,
             models: c.models.clone(),
             secret: c.auth.secret_ref().cloned(),
-            models_for: c.endpoint.clone(),
+            models_for: c.endpoint.as_deref().map(|e| e.trim().to_owned()),
         }
     }
 
-    /// Replaces `models` with what a test found at the address now in the form. They are kept on
-    /// save unless the address changes again afterwards.
-    pub fn set_models(&mut self, models: Vec<ModelInfo>) {
+    /// Replaces `models` with what a test found, where `address` is the value the `endpoint`
+    /// field held when that test was started — not the URL the test called, and not whatever the
+    /// field holds now.
+    ///
+    /// A test is not instant and the address stays editable while it runs, so its answer can
+    /// arrive after the address has changed, or after a later test at the new address has already
+    /// answered. Recording it then would file one endpoint's models under another, which is what
+    /// [`models_fit`](Self::models_fit) exists to prevent. An answer is therefore taken only while
+    /// the field still holds the address it was asked of, and a late one is dropped. Returns
+    /// whether the models were taken, so a caller can say "this result is out of date".
+    ///
+    /// A caller with the answer already in hand passes the address it used just the same; it
+    /// cannot have moved on, so the call always takes.
+    #[must_use]
+    pub fn set_models(&mut self, address: &str, models: Vec<ModelInfo>) -> bool {
+        if address.trim() != self.endpoint.trim() {
+            return false;
+        }
         self.models = models;
         self.models_for = Some(self.endpoint.trim().to_owned());
+        true
     }
 
     /// Known model provenance must match the current address, including after repeated edits.

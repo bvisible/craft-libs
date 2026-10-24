@@ -14,10 +14,11 @@ use crate::configure::ValidationError;
 use crate::content::ContentBuilder;
 use crate::error::KrillaResult;
 use crate::geom::{Rect, Size, Transform};
+use crate::graphics::xobject::write_group_color_space;
 use crate::interactive::annotation::Annotation;
 use crate::interchange::tagging::{Identifier, PageTagIdentifier};
 use crate::resource::ResourceDictionary;
-use crate::serialize::{PageInfo, SerializeContext};
+use crate::serialize::{GroupColorSpace, PageInfo, SerializeContext};
 use crate::stream::{FilterStreamBuilder, Stream};
 use crate::surface::Surface;
 use crate::tagging::AnnotationIdentifier;
@@ -412,8 +413,20 @@ impl InternalPage {
             }
         }
 
+        // Under CMYK blending, a page that blends gets a page group naming the space its
+        // content groups inherit. Opaque pages stay without one (PDF/X-1a and X-3).
+        let page_group_cs = (sc.serialize_settings().group_color_space == GroupColorSpace::Cmyk
+            && sc.uses_transparency(&self.stream_resources))
+        .then(|| sc.cmyk_group_color_space(chunk_container));
+
         let chunk = &mut chunk_container.non_stream.pages;
         let mut page = chunk.page(root_ref);
+        if let Some(cs) = page_group_cs {
+            let mut group = page.group();
+            group.transparency();
+            write_group_color_space(&mut group, cs);
+            group.finish();
+        }
         self.stream_resources.to_pdf_resources(
             &mut page,
             sc,
