@@ -196,6 +196,10 @@ pub struct NoraPanel {
     /// Whether the host opens a page of the instance ([`Output::Open`]): a link of a reply, a card's Open. Without
     /// it a link is shown as its words, never as something to click that does nothing.
     pub open_links: bool,
+    /// Only the cards' Open lead to a page: a reply's link to the instance is its words too, as any other. For an app
+    /// whose window shows what others wrote (mail), where a link Nora repeats may come from a message rather than from
+    /// her: the cards are the server's, their links its own.
+    pub links_on_cards_only: bool,
     draft: String,
     focus_input: bool,
     scroll_to_end: bool,
@@ -399,7 +403,9 @@ impl NoraPanel {
                     let pages: Vec<(String, String)> = pieces
                         .into_iter()
                         .filter_map(|piece| match piece {
-                            Segment::Link { label, url } if self.open_links && session.page_of(&url).is_some() => Some((label, url)),
+                            Segment::Link { label, url } if self.open_links && !self.links_on_cards_only && session.page_of(&url).is_some() => {
+                                Some((label, url))
+                            }
                             _ => None,
                         })
                         .collect();
@@ -983,6 +989,22 @@ mod tests {
         );
         assert!(h.query_by_label_contains("**").is_none(), "no star is shown");
         assert!(h.query_by_label("ce site").is_none(), "a link from the Markdown is only its words");
+    }
+
+    #[test]
+    fn where_only_the_cards_lead_to_pages_a_reply_s_link_to_the_instance_is_its_words() {
+        let reply = "Le brouillon est prêt : [Ouvrir le brouillon](/app/webmail?uid=4). Voir aussi [ce site](https://elsewhere.example/x).";
+        let cards = json!([{ "token": "c1", "kind": "Document", "status": "Executed", "title": "Brouillon · Fuite d'eau",
+            "conversation_id": "t1", "payload": { "editor_url": "/app/webmail?uid=9", "open_label": "Ouvrir la carte" } }]);
+        let mut h = harness(replied_with(reply, cards));
+        h.state_mut().panel.open_links = true;
+        h.state_mut().panel.links_on_cards_only = true;
+        h.run();
+        assert!(h.query_by_label("Le brouillon est prêt : Ouvrir le brouillon. Voir aussi ce site.").is_some(), "the words");
+        assert!(h.query_by_label("Ouvrir le brouillon").is_none() && h.query_by_label("ce site").is_none(), "no link of the reply");
+        h.get_by_label("Ouvrir la carte").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::OpenLink("/app/webmail?uid=9".into())]);
     }
 
     #[test]
