@@ -1498,7 +1498,7 @@ fn poll_work(nora: &mut NoraSession, now: u64, replies: Value, cards: Value, wor
     out
 }
 
-fn event_card() -> Value {
+fn appointment_card() -> Value {
     json!({"token": "c-evt", "kind": "Event", "status": "Pending", "title": "Rendez-vous · Parler du plan", "conversation_id": "t1",
            "payload": {"summary": "« Parler du plan » le 28-10-2026 à 10:00", "confirm_label": "Ajouter à mon agenda"}})
 }
@@ -1514,7 +1514,7 @@ fn the_pane_reads_on_while_the_server_says_the_work_goes_on() {
     poll_work(&mut nora, 5_000, json!([answer]), json!([]), Some(json!({"open": true, "at": 1_002.0})));
     assert!(nora.is_busy());
     // The card comes after the answer, with the work done.
-    poll_work(&mut nora, 20_000, json!([answer]), json!([event_card()]), Some(json!({"open": false, "at": 1_020.0})));
+    poll_work(&mut nora, 20_000, json!([answer]), json!([appointment_card()]), Some(json!({"open": false, "at": 1_020.0})));
     assert_eq!(nora.cards().len(), 1, "the card made after the answer is shown");
     nora.handle(Input::Tick { now_ms: 21_600 });
     assert!(!nora.is_busy() && nora.last_error().is_none());
