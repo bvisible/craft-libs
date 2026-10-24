@@ -35,7 +35,7 @@ mod markdown;
 
 use std::time::Duration;
 
-use craft_nora::{ChatMessage, Confirmation, DocActionKind, Input, NoraError, NoraSession, Output, Role, Segment, ShownCard, segments};
+use craft_nora::{ChatMessage, Confirmation, Correction, DocActionKind, Input, NoraError, NoraSession, Output, Role, Segment, ShownCard, segments};
 use egui::{
     Align, Button, CentralPanel, Color32, Context, CornerRadius, Event, FontFamily, FontId, Frame, Id, Key, KeyboardShortcut, Label, Layout, Margin,
     Modifiers, Panel, RichText, ScrollArea, Stroke, TextEdit, TextStyle, Ui, Visuals,
@@ -200,12 +200,32 @@ impl Default for ResumeWords {
     }
 }
 
+/// What the panel says of a reply of Nora's whose turn could not act in the document in time (`NoraSession::correction`):
+/// in place of a reply when nothing was done (it may say it was), under it when part was. English by default: an app
+/// sets its own words here.
+#[derive(Debug, Clone)]
+pub struct CorrectionWords {
+    pub nothing_done: String,
+    pub partly_done: String,
+}
+
+impl Default for CorrectionWords {
+    fn default() -> Self {
+        CorrectionWords {
+            nothing_done: "Nothing was done in the document: Nora could not act in it in time. Ask again if you still need it.".into(),
+            partly_done: "Not all of this was done: part of it could not run in the document in time.".into(),
+        }
+    }
+}
+
 /// The conversation with Nora, drawn into the `Ui` it is given (a side panel, a window…).
 #[derive(Debug, Default)]
 pub struct NoraPanel {
     pub labels: NoraLabels,
     /// Under a turn lost to a page that ran nothing: what is said, and the button that sends the request again.
     pub resume_words: ResumeWords,
+    /// What is said of a reply whose turn could not act in the document in time.
+    pub correction_words: CorrectionWords,
     /// Set when the app does not carry the person's answer to a card (it drops [`PanelAction::AnswerCard`] and
     /// [`PanelAction::ChooseOnCard`]): why, in one line, shown on a card that waits for the person in place of its
     /// buttons, which would do nothing. `None` (the default): the buttons.
@@ -329,7 +349,15 @@ impl NoraPanel {
                 self.card(ui, session, shown, colors, actions);
             }
             for (index, message) in transcript.iter().enumerate() {
-                self.bubble(ui, session, message, colors, actions);
+                // A reply written before Nora knew that what she asked of the document was refused: never shown as done.
+                match session.correction(index) {
+                    Some(Correction::NothingDone) => self.notice(ui, &self.correction_words.nothing_done, colors),
+                    Some(Correction::PartlyDone) => {
+                        self.bubble(ui, session, message, colors, actions);
+                        self.notice(ui, &self.correction_words.partly_done, colors);
+                    }
+                    None => self.bubble(ui, session, message, colors, actions),
+                }
                 for shown in cards.iter().filter(|shown| shown.after == Some(index + 1)) {
                     self.card(ui, session, shown, colors, actions);
                 }
@@ -371,6 +399,11 @@ impl NoraPanel {
         // Asked again next frame while the view is short of the end (something came in the same frame).
         self.scroll_to_end &= at < end - 0.5;
         self.end_offset = end;
+    }
+
+    /// A word of the panel itself, in the warning colour.
+    fn notice(&self, ui: &mut Ui, text: &str, colors: &Colors) {
+        ui.add(Label::new(RichText::new(text).color(colors.warn)).wrap());
     }
 
     fn bubble(&self, ui: &mut Ui, session: &NoraSession, message: &ChatMessage, colors: &Colors, actions: &mut Vec<PanelAction>) {
@@ -827,6 +860,55 @@ mod tests {
         let mut fine = harness(conversation());
         fine.run();
         assert!(fine.query_by_label("Resume").is_none());
+    }
+
+    /// A turn whose write was refused when the tab came back (or expired unread): Nora's reply, written before she knew,
+    /// says it is done. The panel says what is true in its place; a turn that did part of it keeps the reply, with a
+    /// word under it (24.10, NeoMail).
+    #[test]
+    fn a_reply_that_says_done_after_its_write_was_refused_is_not_shown_as_done() {
+        let refused = |ran_first: bool| {
+            let mut nora = session();
+            let sent = nora.handle(Input::Send("Write 42 in B2".into()));
+            answer(&mut nora, &sent[0], json!({ "thread_id": "t1", "sent_at": 1_000.0 }));
+            let polls = nora.handle(Input::Tick { now_ms: 10 });
+            answer(&mut nora, &polls[0], json!({ "messages": [] }));
+            if ran_first {
+                let action = json!({ "action": "doc_type_text", "text": "41", "callback_id": "c0" });
+                let played = answer(&mut nora, &polls[1], json!({ "actions": [action], "queued_at": [1_001.0], "now": 1_001.5 }));
+                let id = played.iter().find_map(|output| if let Output::Document(call) = output { Some(call.id) } else { None }).unwrap();
+                nora.handle(Input::DocumentResult { id, result: Ok(json!({ "ok": true })) });
+                let polls = nora.handle(Input::Tick { now_ms: 500 });
+                answer(&mut nora, &polls[0], json!({ "messages": [] }));
+                let action = json!({ "action": "doc_type_text", "text": "42", "callback_id": "c1" });
+                answer(&mut nora, &polls[1], json!({ "actions": [action], "queued_at": [1_002.0], "now": 1_500.0 }));
+            } else {
+                let action = json!({ "action": "doc_type_text", "text": "42", "callback_id": "c1" });
+                answer(&mut nora, &polls[1], json!({ "actions": [action], "queued_at": [1_002.0], "now": 1_500.0 }));
+            }
+            let polls = nora.handle(Input::Tick { now_ms: 1_000 });
+            let reply = json!({ "role": "assistant", "text": "Done: B2 holds 42.", "ts": 1_501.0 });
+            answer(&mut nora, &polls[0], json!({ "messages": [reply] }));
+            answer(&mut nora, &polls[1], json!({ "actions": [] }));
+            nora.handle(Input::Tick { now_ms: 5_000 });
+            nora
+        };
+        let mut nothing = harness(refused(false));
+        nothing.run();
+        assert!(nothing.query_by_label("Done: B2 holds 42.").is_none(), "never shown as done");
+        assert!(nothing.query_by_label(CorrectionWords::default().nothing_done.as_str()).is_some());
+        let mut partly = harness(refused(true));
+        partly.run();
+        assert!(partly.query_by_label("Done: B2 holds 42.").is_some());
+        assert!(partly.query_by_label(CorrectionWords::default().partly_done.as_str()).is_some());
+        let mut french = harness(refused(false));
+        french.state_mut().panel.correction_words.nothing_done = "Rien n'a été fait dans le document.".into();
+        french.run();
+        assert!(french.query_by_label("Rien n'a été fait dans le document.").is_some());
+        // A turn that went well says nothing of the kind.
+        let mut fine = harness(conversation());
+        fine.run();
+        assert!(fine.query_by_label(CorrectionWords::default().nothing_done.as_str()).is_none());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 // //// Neoffice — added file (no upstream equivalent): end-to-end tests of the Nora conversation state machine.
 
 use craft_nora::{
-    AppKind, CommandPolicy, DocActionKind, DocumentCall, DocumentInfo, HttpRequest, HttpResponse, Input, NoraError, NoraSession, Output, PageContext,
-    SessionConfig, protocol,
+    AppKind, CommandPolicy, Correction, DocActionKind, DocumentCall, DocumentInfo, HttpRequest, HttpResponse, Input, NoraError, NoraSession, Output,
+    PageContext, SessionConfig, protocol,
 };
 use serde_json::{Value, json};
 
@@ -1295,11 +1295,40 @@ fn a_read_answered_while_the_page_ran_nothing_is_refused() {
     nora.handle(ok(&messages, json!({"success": true, "messages": [], "cards": []})));
     let refused = nora.handle(ok(&queue, json!({"success": true, "actions": [type_text("c1")], "queued_at": [1_000.5], "now": 1_000.6})));
     assert!(documents(&refused).is_empty() && refused_with(&refused, "c1").contains("background"));
-    // The next read is judged by the server's times again: an action queued now runs... in another turn.
+    // Back from a gap the pane saw itself, an action of the same turn is refused even when the server says it was
+    // queued after it (24.10: the pane keeps the gap until the turn ends); the request can be resumed.
     let mut other = started_at(1_000.0);
     poll(&mut other, 100, json!([]), json!([]));
-    let fresh = poll_queue(&mut other, 480_100, json!({"actions": [type_text("c2")], "queued_at": [1_480.0], "now": 1_480.2}));
-    assert_eq!(documents(&fresh).len(), 1, "queued after the page came back, while Nora waits for it");
+    let after = poll_queue(&mut other, 70_100, json!({"actions": [type_text("c2")], "queued_at": [1_070.0], "now": 1_070.2}));
+    assert!(documents(&after).is_empty() && refused_with(&after, "c2").contains("background"));
+    poll(&mut other, 73_200, json!([{"role": "assistant", "text": "Rien n'a été modifié.", "ts": 1_073.0}]), json!([]));
+    other.handle(Input::Tick { now_ms: 75_000 });
+    assert_eq!(other.resumable(), Some("Bonjour"));
+}
+
+/// A server that gives no queue times (an older one, a fake one): after a gap the pane saw itself, the first read can
+/// come back empty and the late action come with the next. Every action of the turn is refused until it ends; the next
+/// turn's run again (24.10, seen by NeoDoc's agent).
+#[test]
+fn without_the_server_s_times_every_action_after_a_gap_is_refused_until_the_turn_ends() {
+    let mut nora = started();
+    poll(&mut nora, 100, json!([]), json!([]));
+    let first = poll_queue(&mut nora, 70_000, json!({"actions": []}));
+    assert!(documents(&first).is_empty());
+    let late = poll_queue(&mut nora, 73_100, json!({"actions": [type_text("c1")]}));
+    assert!(documents(&late).is_empty() && refused_with(&late, "c1").contains("background"));
+    let later = poll_queue(&mut nora, 76_200, json!({"actions": [{"action": "doc_observe", "callback_id": "c2"}]}));
+    assert!(documents(&later).is_empty() && refused_with(&later, "c2").contains("background"), "a reading too");
+    poll(&mut nora, 79_300, json!([{"role": "assistant", "text": "C'est fait."}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 81_000 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.resumable(), Some("Bonjour"));
+    assert_eq!(nora.correction(1), Some(Correction::NothingDone), "« C'est fait » is not shown as it is");
+    // The next turn starts without the gap.
+    let sent = nora.handle(Input::Send("Bonjour".into()));
+    nora.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1"})));
+    let fresh = poll_queue(&mut nora, 81_100, json!({"actions": [type_text("c3")]}));
+    assert_eq!(documents(&fresh).len(), 1);
 }
 
 #[test]
@@ -1452,4 +1481,142 @@ fn an_action_without_an_address_runs_as_before() {
     let mut nora = started_on_file("20795bd915");
     let outputs = poll(&mut nora, 100, json!([]), json!([{"action": "doc_observe", "callback_id": "r1"}]));
     assert_eq!(documents(&outputs).len(), 1);
+}
+
+/// One read at `now`, the replies answered as `replies` and `cards`, with the server's word on the work still open
+/// (`work`, or none), and an empty action queue.
+fn poll_work(nora: &mut NoraSession, now: u64, replies: Value, cards: Value, work: Option<Value>) -> Vec<Output> {
+    let outputs = nora.handle(Input::Tick { now_ms: now });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    let mut answer = json!({"success": true, "messages": replies, "cards": cards});
+    if let Some(work) = work {
+        answer["work"] = work;
+    }
+    let mut out = nora.handle(ok(&messages, answer));
+    out.extend(nora.handle(ok(&queue, json!({"success": true, "actions": []}))));
+    out
+}
+
+fn event_card() -> Value {
+    json!({"token": "c-evt", "kind": "Event", "status": "Pending", "title": "Rendez-vous · Parler du plan", "conversation_id": "t1",
+           "payload": {"summary": "« Parler du plan » le 28-10-2026 à 10:00", "confirm_label": "Ajouter à mon agenda"}})
+}
+
+/// The agent's answer may only hand over to a pole, whose card and result come later (NeoMail's appointment card, 24.10):
+/// while the server says work goes on for the turn, the pane reads on, and the turn ends once it says the work is done.
+#[test]
+fn the_pane_reads_on_while_the_server_says_the_work_goes_on() {
+    let mut nora = started_at(1_000.0);
+    let answer = json!({"role": "assistant", "text": "Je prépare le rendez-vous.", "ts": 1_002.0});
+    poll_work(&mut nora, 100, json!([answer]), json!([]), Some(json!({"open": true, "at": 1_002.0})));
+    // Long past the settle time, the turn still reads.
+    poll_work(&mut nora, 5_000, json!([answer]), json!([]), Some(json!({"open": true, "at": 1_002.0})));
+    assert!(nora.is_busy());
+    // The card comes after the answer, with the work done.
+    poll_work(&mut nora, 20_000, json!([answer]), json!([event_card()]), Some(json!({"open": false, "at": 1_020.0})));
+    assert_eq!(nora.cards().len(), 1, "the card made after the answer is shown");
+    nora.handle(Input::Tick { now_ms: 21_600 });
+    assert!(!nora.is_busy() && nora.last_error().is_none());
+}
+
+/// A server that says nothing of the work ends the turn with its answer, as before.
+#[test]
+fn without_the_server_s_word_the_turn_ends_with_its_answer() {
+    let mut nora = started_at(1_000.0);
+    let answer = json!({"role": "assistant", "text": "Voici la réponse.", "ts": 1_002.0});
+    poll_work(&mut nora, 100, json!([answer]), json!([]), None);
+    nora.handle(Input::Tick { now_ms: 1_700 });
+    assert!(!nora.is_busy());
+}
+
+/// Work the server said open for a delivery made before this message is the turn before's.
+#[test]
+fn work_said_open_before_the_message_is_not_this_turn_s() {
+    let mut nora = started_at(1_000.0);
+    let answer = json!({"role": "assistant", "text": "Voici la réponse.", "ts": 1_002.0});
+    poll_work(&mut nora, 100, json!([answer]), json!([]), Some(json!({"open": true, "at": 990.0})));
+    nora.handle(Input::Tick { now_ms: 1_700 });
+    assert!(!nora.is_busy());
+}
+
+/// Work announced that never brings anything ends the turn quietly after the silence: the answer is in, no failure.
+#[test]
+fn work_that_never_comes_ends_the_turn_quietly() {
+    let mut nora = started_at(1_000.0);
+    let answer = json!({"role": "assistant", "text": "Le pôle Support prépare le rendez-vous.", "ts": 1_002.0});
+    let open = Some(json!({"open": true, "at": 1_002.0}));
+    poll_work(&mut nora, 100, json!([answer]), json!([]), open.clone());
+    poll_work(&mut nora, 479_000, json!([answer]), json!([]), open.clone());
+    poll_work(&mut nora, 482_000, json!([answer]), json!([]), open);
+    nora.handle(Input::Tick { now_ms: 482_500 });
+    assert!(!nora.is_busy(), "ended");
+    assert!(nora.last_error().is_none(), "quietly: the answer is in");
+    assert!(nora.resumable().is_none());
+}
+
+/// Where the reply `text` is in the transcript.
+fn index_of(nora: &NoraSession, text: &str) -> usize {
+    nora.transcript().iter().position(|message| message.text == text).unwrap_or_else(|| panic!("no « {text} »"))
+}
+
+/// The NeoMail case of 24.10: a tab frozen eight minutes, the write refused when it came back, and Nora's reply, written
+/// before she knew, says the draft is ready. The person never reads that it was done.
+#[test]
+fn a_reply_that_says_done_after_its_write_was_refused_is_corrected() {
+    let mut nora = started_at(1_000.0);
+    let draft = json!({"action": "doc_execute", "command": "draft.new", "params": {}, "callback_id": "w1"});
+    let refused = poll_queue(&mut nora, 100, json!({"actions": [draft], "queued_at": [1_002.0], "now": 1_482.0}));
+    assert!(documents(&refused).is_empty());
+    let ack = "Je m'en occupe.";
+    let done = "La réponse est prête dans votre brouillon.";
+    poll(&mut nora, 600, json!([{"role": "assistant", "text": ack, "ts": 1_483.0}, {"role": "assistant", "text": done, "ts": 1_484.0}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 3_000 });
+    assert_eq!(nora.correction(index_of(&nora, done)), Some(Correction::NothingDone));
+    assert_eq!(nora.correction(index_of(&nora, ack)), None, "an acknowledgement claims nothing");
+    assert_eq!(nora.correction(0), None, "nor does the person's message");
+}
+
+#[test]
+fn a_turn_that_did_part_of_it_is_said_partly_done() {
+    let mut nora = started_at(1_000.0);
+    let first = poll_queue(&mut nora, 100, json!({"actions": [type_text("c1")], "queued_at": [1_001.0], "now": 1_001.5}));
+    let played = documents(&first);
+    assert_eq!(played.len(), 1);
+    nora.handle(Input::DocumentResult { id: played[0].id, result: Ok(json!({"ok": true})) });
+    let late = poll_queue(&mut nora, 600, json!({"actions": [type_text("c2")], "queued_at": [1_002.0], "now": 1_490.0}));
+    assert!(documents(&late).is_empty());
+    let done = "J'ai écrit 42 et 43.";
+    poll(&mut nora, 1_100, json!([{"role": "assistant", "text": done, "ts": 1_491.0}]), json!([]));
+    assert_eq!(nora.correction(index_of(&nora, done)), Some(Correction::PartlyDone));
+}
+
+/// A reading refused claims nothing done; a turn that went well needs no word; a queue that expired unread may have
+/// held a change.
+#[test]
+fn only_what_could_have_been_done_is_corrected() {
+    let mut reading = started_at(1_000.0);
+    poll_queue(&mut reading, 100, json!({"actions": [{"action": "doc_observe", "callback_id": "r1"}], "queued_at": [1_002.0], "now": 1_482.0}));
+    poll(&mut reading, 600, json!([{"role": "assistant", "text": "Je n'ai pas pu lire le document.", "ts": 1_483.0}]), json!([]));
+    assert_eq!(reading.correction(1), None);
+    let mut fine = started_at(1_000.0);
+    let played = poll_queue(&mut fine, 100, json!({"actions": [type_text("c1")], "queued_at": [1_001.0], "now": 1_001.5}));
+    fine.handle(Input::DocumentResult { id: documents(&played)[0].id, result: Ok(json!({"ok": true})) });
+    poll(&mut fine, 600, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_002.0}]), json!([]));
+    assert_eq!(fine.correction(1), None);
+    let mut missed = started_at(1_000.0);
+    poll_queue(&mut missed, 100, json!({"actions": [], "missed": 1_002.0, "now": 1_490.0}));
+    poll(&mut missed, 600, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_491.0}]), json!([]));
+    assert_eq!(missed.correction(1), Some(Correction::NothingDone));
+}
+
+/// The pane gave the turn up and told the person; Nora's late answer says it was done, and her write was refused late.
+#[test]
+fn a_late_answer_whose_write_was_refused_is_corrected() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    let late = poll_queue(&mut nora, 495_200, json!({"actions": [type_text("c1")], "queued_at": [1_490.0], "now": 1_495.0}));
+    assert!(documents(&late).is_empty());
+    poll(&mut nora, 510_200, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_496.0}]), json!([]));
+    assert_eq!(nora.correction(1), Some(Correction::NothingDone));
 }

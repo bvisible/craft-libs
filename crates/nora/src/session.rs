@@ -11,7 +11,7 @@ use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
     self, Addressee, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, addressees_of, card_answer_body, card_choice_body,
     card_refusal_body, missed_of, observation_body, observation_error, observation_ok, parse_actions, parse_messages, post_message_body,
-    queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of, waits_of,
+    queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of, waits_of, work_of,
 };
 use crate::reply::instance_path;
 
@@ -270,6 +270,34 @@ pub struct NoraSession {
     /// A turn of this conversation was given up on, or lost: from then on an action queued before the turn under way
     /// is that turn's, and is refused ([`Self::of_an_earlier_turn`]). Until a new conversation.
     abandoned: bool,
+    /// The server says work still goes on for this turn (a pole at work after the agent's answer, `work` of a delivery
+    /// made after this turn's message): the turn does not end with its answer, it reads on for what the work brings
+    /// (its cards, its result).
+    work_open: bool,
+    /// For each turn (by where its message is in the transcript): whether something it asked of the document was done,
+    /// and whether something it asked was refused after Nora may have answered (a tab in the background, a turn given up
+    /// on) or expired unread ([`Self::correction`]).
+    turn_marks: HashMap<usize, TurnMark>,
+    /// The page drew nothing for [`SessionConfig::frozen_ms`] while this turn ran (a tab in the background, a computer
+    /// asleep): kept by the pane itself until the turn ends, and every action of the turn read after it is refused,
+    /// whatever the server says of when it was queued (a server older than its times, a fake one, says nothing).
+    frozen_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TurnMark {
+    acted: bool,
+    refused: bool,
+}
+
+/// What the pane says of a reply of Nora's whose turn could not act in the document in time ([`NoraSession::correction`]):
+/// her reply may say it was done, written before she knew, and the person must never read that it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correction {
+    /// Nothing the turn asked of the document was done: the reply is not shown as it is.
+    NothingDone,
+    /// Part of it was done, part was not: the reply is shown with a word under it.
+    PartlyDone,
 }
 
 impl NoraSession {
@@ -308,6 +336,9 @@ impl NoraSession {
             thaw_ms: None,
             lost: false,
             abandoned: false,
+            work_open: false,
+            turn_marks: HashMap::new(),
+            frozen_seen: false,
         }
     }
 
@@ -358,6 +389,20 @@ impl NoraSession {
     /// The session is not busy meanwhile: the person may write again.
     pub fn reads_late(&self) -> bool {
         self.late_until_ms.is_some()
+    }
+
+    /// What the pane says of the reply at `index` of the transcript, when its turn asked the document for something that
+    /// was refused after Nora may have answered (the tab came back late, the turn was given up on) or expired unread:
+    /// her reply, written before she knew, may say it was done. `None` for any other message, an acknowledgement
+    /// included (it claims nothing).
+    pub fn correction(&self, index: usize) -> Option<Correction> {
+        let reply = self.transcript.get(index)?;
+        if reply.role != Role::Assistant || self.is_interim(reply) {
+            return None;
+        }
+        let start = self.transcript[..index].iter().rposition(|message| message.role == Role::User)?;
+        let mark = self.turn_marks.get(&start)?;
+        mark.refused.then_some(if mark.acted { Correction::PartlyDone } else { Correction::NothingDone })
     }
 
     /// The message of the last turn, when that turn is over and lost an action to a page that ran nothing (a tab in the
@@ -465,6 +510,8 @@ impl NoraSession {
         self.last_activity_ms = self.now_ms;
         self.turn_started_ms = self.now_ms;
         self.final_seen_ms = None;
+        self.work_open = false;
+        self.frozen_seen = false;
         let request = match self.thread_id.clone() {
             Some(thread) => self.request(protocol::POST_MESSAGE, post_message_body(&thread, &text, &self.context), Pending::Send),
             None => self.request(protocol::START_OR_RESUME_THREAD, start_thread_body(&text, &self.context), Pending::Send),
@@ -480,6 +527,7 @@ impl NoraSession {
             if self.watch_ms.is_some_and(|last| now_ms.saturating_sub(last) >= self.cfg.frozen_ms) {
                 self.thaw_ms = Some(now_ms);
                 thawing = true;
+                self.frozen_seen |= self.busy;
             }
             self.watch_ms = Some(now_ms);
         } else {
@@ -495,8 +543,10 @@ impl NoraSession {
             && self.inflight.values().all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions | Pending::CardAnswer(_)));
         // Done first, so that a finished turn ends without one more poll. The final reply is in and the
         // actions queued with it have had their moment...
+        // While the server says work goes on for the turn (a pole after the agent's answer), the turn reads on for what
+        // it brings: a card made after the answer, the pole's result.
         let settled = self.final_seen_ms.is_some_and(|seen| now_ms.saturating_sub(seen) >= self.cfg.settle_ms);
-        if nothing_pending && settled {
+        if nothing_pending && settled && !self.work_open {
             self.finish(out);
             return;
         }
@@ -505,7 +555,12 @@ impl NoraSession {
         // Not at the tick that comes back from a gap: the answers that waited in the page (the send's, a read's) are not
         // handed over yet, and the clock alone says nothing of them. The next tick, one frame later, judges.
         if nothing_running && !thawing && self.silent(now_ms) {
-            self.give_up(NoraError::Timeout, out);
+            // The answer is in: work the server announced and that brought nothing for that long ends the turn quietly.
+            if self.final_seen_ms.is_some() && self.work_open {
+                self.finish(out);
+            } else {
+                self.give_up(NoraError::Timeout, out);
+            }
             return;
         }
         if let Some(thread) = self.thread_id.clone()
@@ -651,6 +706,10 @@ impl NoraSession {
                     self.last_error = None;
                     self.last_failure = None;
                 }
+                // Work said open by a delivery made before this turn's message is an earlier turn's (and until the server
+                // took this message, `sent_at` is the turn before's).
+                self.work_open =
+                    self.send_answered && work_of(&message).is_some_and(|(open, at)| open && self.sent_at.is_some_and(|sent| at >= sent));
                 if !self.absorb_replies(&message, out) {
                     self.quiet_read_ms = self.read_sent_ms;
                 }
@@ -667,16 +726,29 @@ impl NoraSession {
                 let waited = self.waited_too_long(&message);
                 let earlier = self.of_an_earlier_turn(&message);
                 let addressees = addressees_of(&message);
-                for (((action, too_long), earlier), to) in parse_actions(&message).into_iter().zip(waited).zip(earlier).zip(addressees) {
+                let (queued, _) = waits_of(&message);
+                let actions = parse_actions(&message).into_iter().zip(waited).zip(earlier).zip(addressees);
+                for (index, (((action, too_long), earlier), to)) in actions.enumerate() {
+                    // This turn's (queued after its message, or of a server that says no time): its refusal may contradict
+                    // what Nora then said ([`Self::correction`]).
+                    let this_turn = self.send_answered && self.sent_at.zip(queued.get(index).copied().flatten()).is_none_or(|(sent, at)| at >= sent);
                     if !self.addressed_here(&to) {
                         self.refuse(action, ELSEWHERE, out);
                     } else if stale {
                         self.refuse(action, STOPPED, out);
                     } else if given_up {
+                        self.note_refusal(&action, this_turn);
                         self.refuse(action, LATE, out);
                     } else if earlier {
                         self.refuse(action, EARLIER, out);
-                    } else if too_long || self.lost {
+                    } else if too_long || self.lost || self.frozen_seen {
+                        // After a gap the pane saw itself, any action of the turn: its queue time, when the server
+                        // gives none, says nothing of whether it waited through the gap. The turn is lost then.
+                        if self.frozen_seen && this_turn {
+                            self.lost = true;
+                            self.abandoned = true;
+                        }
+                        self.note_refusal(&action, this_turn);
                         self.refuse(action, FROZEN, out);
                     } else {
                         self.last_activity_ms = self.now_ms;
@@ -775,6 +847,15 @@ impl NoraSession {
         out.push(Output::Changed);
     }
 
+    /// An action of this turn that would have done something with the document, refused after Nora may have answered
+    /// (the tab came back late, the pane had given the turn up): her answer may say it was done ([`Self::correction`]).
+    /// A refusal the editor answers at once, she reads before she answers.
+    fn note_refusal(&mut self, action: &RemoteAction, this_turn: bool) {
+        if this_turn && matches!(action, RemoteAction::Doc(doc) if doc.kind.acts()) {
+            self.turn_marks.entry(self.turn_index).or_default().refused = true;
+        }
+    }
+
     /// Answers the action Nora waits on, if it waits, without running it.
     fn refuse(&mut self, action: RemoteAction, why: &str, out: &mut Vec<Output>) {
         let callback = match action {
@@ -842,6 +923,8 @@ impl NoraSession {
         if missed_of(message).is_some_and(|at| this_turn(Some(at))) {
             self.lost = true;
             self.abandoned = true;
+            // What expired unread is unknown: it may have been a change Nora then said was made.
+            self.turn_marks.entry(self.turn_index).or_default().refused = true;
         }
         let limit = self.cfg.frozen_ms as f64 / 1000.0;
         let count = parse_actions(message).len();
@@ -1006,6 +1089,9 @@ impl NoraSession {
     }
 
     fn run_document(&mut self, action: DocAction, out: &mut Vec<Output>) {
+        if action.kind.acts() {
+            self.turn_marks.entry(self.turn_index).or_default().acted = true;
+        }
         let id = self.new_id();
         let undo = action.kind == DocActionKind::Undo;
         self.running.insert(id, Running { callback_id: action.callback_id, modifies: action.kind.modifies(), summary: action.kind.summary(), undo });
@@ -1079,11 +1165,14 @@ impl NoraSession {
         self.last_failure = None;
         self.turn_started_ms = 0;
         self.final_seen_ms = None;
+        self.work_open = false;
+        self.frozen_seen = false;
         self.next_poll_ms = None;
         self.inflight.clear();
         self.running.clear();
         self.waiting.clear();
         self.changes.clear();
+        self.turn_marks.clear();
         self.outcome = None;
         self.refuse_older_actions = false;
         self.cards.clear();

@@ -313,6 +313,14 @@ pub fn addressees_of(message: &Value) -> Vec<Addressee> {
         .unwrap_or_default()
 }
 
+/// Whether work still goes on for the conversation, as the server says with `get_messages` (`work`): `(open, at)`, the
+/// server time of the delivery that said it. The agent's answer may only hand over to a pole, whose card and result
+/// come minutes later; a pane reads on while it is open. `None` from a server that says nothing of it.
+pub fn work_of(message: &Value) -> Option<(bool, f64)> {
+    let work = message.get("work")?;
+    Some((work.get("open").and_then(Value::as_bool)?, work.get("at").and_then(Value::as_f64)?))
+}
+
 /// The server time at which the action queue of `get_browser_actions` was last filled.
 pub fn queued_at_of(message: &Value) -> Option<f64> {
     message.get("timestamp").and_then(Value::as_f64)
@@ -459,6 +467,12 @@ impl DocActionKind {
     /// Whether it can change the document (and so deserves an Undo).
     pub fn modifies(&self) -> bool {
         matches!(self, DocActionKind::Execute { .. } | DocActionKind::Batch { .. } | DocActionKind::TypeText { .. })
+    }
+
+    /// Whether it does something with the document Nora may then say is done: a change, a save, a print, a file handed
+    /// over for an e-mail draft. A reading is not one.
+    pub fn acts(&self) -> bool {
+        self.modifies() || matches!(self, DocActionKind::Save | DocActionKind::Print | DocActionKind::ExportPdf | DocActionKind::ExportFile)
     }
 
     /// A short sentence for the panel ("Run `format.bold`").
@@ -613,6 +627,14 @@ mod tests {
         assert_eq!(addressees_of(&message), vec![to(Some("t1"), Some("f1")), to(Some("t1"), None), to(None, None), to(None, None)]);
         assert_eq!(addressees_of(&message).len(), parse_actions(&message).len());
         assert!(addressees_of(&json!({"success": true})).is_empty());
+    }
+
+    #[test]
+    fn the_work_still_open_is_read_from_the_replies_answer() {
+        assert_eq!(work_of(&json!({"messages": [], "work": {"open": true, "at": 1001.5}})), Some((true, 1001.5)));
+        assert_eq!(work_of(&json!({"messages": [], "work": {"open": false, "at": 7}})), Some((false, 7.0)));
+        assert_eq!(work_of(&json!({"messages": []})), None);
+        assert_eq!(work_of(&json!({"work": {"open": true}})), None);
     }
 
     #[test]
