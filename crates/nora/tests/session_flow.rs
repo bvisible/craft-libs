@@ -169,13 +169,268 @@ fn silence_ends_the_wait_with_an_error_after_eight_minutes() {
     poll(&mut nora, 100, json!([]), json!([]));
     nora.handle(Input::Tick { now_ms: 479_000 });
     assert!(nora.is_busy());
-    // Even with a poll the host never answered, the wait does end.
-    let outputs = nora.handle(Input::Tick { now_ms: 480_100 });
+    // The read still on its way left before the deadline: it says nothing of the silence after it...
+    nora.handle(Input::Tick { now_ms: 480_100 });
+    assert!(nora.is_busy());
+    // ...but even with a read the host never answers, the wait does end.
+    let outputs = nora.handle(Input::Tick { now_ms: 720_100 });
     assert!(!nora.is_busy());
     assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
     assert_eq!(nora.failure(), Some(&NoraError::Timeout));
     assert_eq!(nora.last_failure(), Some(&NoraError::Timeout), "for the host to say it in its own words");
     assert!(outputs.contains(&Output::Changed));
+}
+
+/// Gives up on the turn of `nora` (started at 0) for silence: a read sent after the deadline brings nothing.
+fn given_up(nora: &mut NoraSession) {
+    poll(nora, 100, json!([]), json!([]));
+    poll(nora, 480_100, json!([]), json!([]));
+    assert!(nora.is_busy(), "the read after the deadline is what says it");
+    nora.handle(Input::Tick { now_ms: 480_200 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.failure(), Some(&NoraError::Timeout));
+}
+
+#[test]
+fn a_read_made_after_the_deadline_that_brings_nothing_ends_the_wait() {
+    let mut nora = started();
+    given_up(&mut nora);
+    assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
+    assert!(nora.reads_late(), "the server may still finish the turn");
+}
+
+/// A tab in the background draws no frame, nor does a machine too busy to draw: the next tick comes minutes later, and
+/// the answer waits on the server. The wait does not end on the clock: the server is read first.
+#[test]
+fn a_clock_that_jumps_reads_the_server_before_giving_up() {
+    let mut nora = started_at(1_000.0);
+    poll(&mut nora, 100, json!([]), json!([]));
+    let answer = json!({"role": "assistant", "text": "Le rendez-vous est prêt.", "ts": 1_500.0});
+    poll(&mut nora, 900_000, json!([answer]), json!([]));
+    assert!(nora.is_busy());
+    assert_eq!((nora.failure(), nora.last_error()), (None, None));
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Le rendez-vous est prêt."));
+    nora.handle(Input::Tick { now_ms: 902_000 });
+    assert!(!nora.is_busy());
+    assert_eq!((nora.failure(), nora.last_error()), (None, None));
+    // The same jump with nothing on the server: one read, then the wait ends.
+    let mut quiet = started();
+    poll(&mut quiet, 100, json!([]), json!([]));
+    poll(&mut quiet, 900_000, json!([]), json!([]));
+    assert!(quiet.is_busy());
+    quiet.handle(Input::Tick { now_ms: 900_100 });
+    assert_eq!(quiet.failure(), Some(&NoraError::Timeout));
+}
+
+/// The turn given up on is read on, every fifteen seconds: its late answer and its card are shown as they come, and the
+/// failure is taken back. The next message is not needed for it.
+#[test]
+fn a_late_answer_and_its_card_are_shown_as_they_come() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    assert_eq!(nora.next_wake_ms(), Some(495_200), "the host is woken for the next late read");
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 490_000 })).is_empty());
+    // A late read that brings nothing leaves the failure shown.
+    poll(&mut nora, 495_200, json!([]), json!([]));
+    assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
+    assert!(nora.reads_late() && !nora.is_busy());
+    let answer = json!({"role": "assistant", "text": "Voici la proposition de rendez-vous.", "ts": 1_600.0});
+    let card = json!({"token": "c-event", "kind": "Event", "status": "Pending", "title": "Rendez-vous", "conversation_id": "t1"});
+    let outputs = nora.handle(Input::Tick { now_ms: 510_200 });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    let shown = nora.handle(ok(&messages, json!({"success": true, "messages": [answer], "cards": [card]})));
+    nora.handle(ok(&queue, json!({"success": true, "actions": []})));
+    assert!(shown.contains(&Output::Changed));
+    assert!(!nora.is_busy(), "shown, not waited for: the person may write again");
+    assert_eq!((nora.last_failure(), nora.last_error()), (None, None), "the failure is taken back");
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Voici la proposition de rendez-vous."));
+    assert_eq!(nora.cards().len(), 1);
+    assert_eq!(nora.cards()[0].after, Some(nora.transcript().len()), "under the late answer");
+    // The answer is in: one more read for what comes with it, then the late reading ends.
+    assert_eq!(nora.next_wake_ms(), Some(511_700));
+    poll(&mut nora, 511_700, json!([answer]), json!([]));
+    assert_eq!(nora.transcript().len(), 2, "a reply is shown once");
+    assert!(nora.reads_late());
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 526_700 })).is_empty());
+    assert!(!nora.reads_late());
+    assert_eq!(nora.next_wake_ms(), None);
+    assert_eq!(nora.last_error(), None);
+}
+
+#[test]
+fn a_late_acknowledgement_is_shown_and_the_late_reading_goes_on() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    let ack = json!({"role": "assistant", "text": "Je transmets votre demande à votre pôle Ventes.", "ts": 1_100.0});
+    poll(&mut nora, 495_200, json!([ack]), json!([]));
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Je transmets votre demande à votre pôle Ventes."));
+    assert_eq!(nora.last_error(), Some("Nora did not answer in time"), "nothing else may come: the failure stays");
+    assert!(nora.reads_late());
+    assert_eq!(nora.next_wake_ms(), Some(510_200));
+    // A read on its way that the host has not answered yet does not wake the window every frame.
+    nora.handle(Input::Tick { now_ms: 510_200 });
+    nora.handle(Input::Tick { now_ms: 530_000 });
+    assert_eq!(nora.next_wake_ms(), Some(545_000));
+}
+
+#[test]
+fn a_new_card_alone_is_news_too() {
+    let mut nora = started();
+    given_up(&mut nora);
+    let card = json!({"token": "c-doc", "kind": "Document", "status": "Executed", "title": "Lettre", "conversation_id": "t1"});
+    poll_with_cards(&mut nora, 495_200, json!([]), json!([card]));
+    assert!(!nora.is_busy() && nora.last_error().is_none() && nora.reads_late());
+    assert_eq!(nora.cards().len(), 1);
+    // While the turn runs, a new card moves the deadline as a reply does.
+    let mut busy = started();
+    poll(&mut busy, 100, json!([]), json!([]));
+    let card = json!({"token": "c-doc", "kind": "Document", "status": "Executed", "title": "Lettre", "conversation_id": "t1"});
+    poll_with_cards(&mut busy, 400_000, json!([]), json!([card]));
+    poll(&mut busy, 480_100, json!([]), json!([]));
+    busy.handle(Input::Tick { now_ms: 480_200 });
+    assert!(busy.is_busy());
+}
+
+/// The person was told Nora did not answer in time, and may have closed the pane: what she asks of the document then is
+/// refused, and she is told why.
+#[test]
+fn a_late_action_is_refused_and_never_runs() {
+    let mut nora = started();
+    given_up(&mut nora);
+    let bold = json!({"action": "doc_execute", "command": "format.bold", "params": {}, "callback_id": "c2"});
+    let outputs = poll(&mut nora, 495_200, json!([]), json!([bold, {"action": "doc_observe", "callback_id": "c3"}]));
+    assert!(documents(&outputs).is_empty());
+    for callback in ["c2", "c3"] {
+        assert!(refusal_of(&outputs, callback).as_str().is_some_and(|why| why.contains("stopped waiting")), "{callback}");
+    }
+    assert!(!nora.is_busy() && !nora.can_undo());
+}
+
+#[test]
+fn a_stop_ends_the_late_reading() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    nora.handle(Input::Cancel);
+    assert!(!nora.reads_late());
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 500_000 })).is_empty());
+    assert_eq!(nora.next_wake_ms(), None);
+    // What the stopped turn still queued is refused when the next message reads it; what this one queues runs.
+    let sent = nora.handle(Input::Send("Autre chose".into()));
+    nora.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1", "sent_at": 1_500.0})));
+    let old = poll_queue(&mut nora, 501_000, json!({"actions": [{"action": "doc_observe", "callback_id": "o1"}], "timestamp": 1_200.0}));
+    assert!(documents(&old).is_empty() && refusal_of(&old, "o1").as_str().is_some());
+    let new = poll_queue(&mut nora, 502_000, json!({"actions": [{"action": "doc_observe", "callback_id": "n1"}], "timestamp": 1_600.0}));
+    assert_eq!(documents(&new).len(), 1);
+}
+
+/// A read on its way when the late reading ends brings an action: the turn was given up on, it is refused all the same.
+#[test]
+fn an_action_answered_after_the_late_reading_ended_is_refused() {
+    let mut nora = started();
+    given_up(&mut nora);
+    let outputs = nora.handle(Input::Tick { now_ms: 1_799_000 });
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    nora.handle(Input::Tick { now_ms: 1_800_000 });
+    assert!(!nora.reads_late());
+    let refused = nora.handle(ok(&queue, json!({"success": true, "actions": [{"action": "doc_observe", "callback_id": "c9"}]})));
+    assert!(documents(&refused).is_empty() && refusal_of(&refused, "c9").as_str().is_some());
+}
+
+#[test]
+fn the_late_reading_stops_thirty_minutes_after_the_turn_started() {
+    let mut nora = started();
+    given_up(&mut nora);
+    poll(&mut nora, 1_000_000, json!([]), json!([]));
+    assert!(nora.reads_late());
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 1_800_000 })).is_empty());
+    assert!(!nora.reads_late());
+    assert_eq!(nora.next_wake_ms(), None);
+    assert_eq!(nora.failure(), Some(&NoraError::Timeout), "the failure stays shown");
+}
+
+#[test]
+fn a_new_conversation_ends_the_late_reading() {
+    let mut nora = started();
+    given_up(&mut nora);
+    nora.handle(Input::Reset);
+    assert!(!nora.reads_late());
+    assert!(requests(&nora.handle(Input::Tick { now_ms: 500_000 })).is_empty());
+    assert_eq!(nora.next_wake_ms(), None);
+}
+
+/// The person asks again while the turn given up on is read late: its late answer is shown, and it is not taken for
+/// the answer to the new message, which the turn waits for.
+#[test]
+fn a_late_answer_that_comes_after_the_next_message_is_shown_without_ending_it() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    let sent = nora.handle(Input::Send("Alors ?".into()));
+    assert!(!nora.reads_late());
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    let late = json!({"role": "assistant", "text": "Réponse au premier message.", "ts": 1_400.0});
+    // Before the server has said when it took the new message, the first one's answer comes.
+    poll(&mut nora, 495_300, json!([late]), json!([]));
+    assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Réponse au premier message."));
+    nora.handle(ok(&post, json!({"thread_id": "t1", "sent_at": 1_500.0})));
+    poll(&mut nora, 497_000, json!([late]), json!([]));
+    nora.handle(Input::Tick { now_ms: 499_000 });
+    assert!(nora.is_busy(), "the late answer is the first message's");
+    let answer = json!({"role": "assistant", "text": "Réponse au second.", "ts": 1_600.0});
+    poll(&mut nora, 500_000, json!([late, answer]), json!([]));
+    nora.handle(Input::Tick { now_ms: 502_000 });
+    assert!(!nora.is_busy());
+    let texts: Vec<&str> = nora.transcript().iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, vec!["Bonjour", "Alors ?", "Réponse au premier message.", "Réponse au second."]);
+    // A reply already taken before the server said when it took the message counts once it has said it.
+    let mut quick = started_at(1_000.0);
+    given_up(&mut quick);
+    let sent = quick.handle(Input::Send("Alors ?".into()));
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    poll(&mut quick, 495_300, json!([{"role": "assistant", "text": "Réponse au second.", "ts": 1_600.0}]), json!([]));
+    quick.handle(ok(&post, json!({"thread_id": "t1", "sent_at": 1_500.0})));
+    poll(&mut quick, 496_000, json!([]), json!([]));
+    quick.handle(Input::Tick { now_ms: 498_000 });
+    assert!(!quick.is_busy());
+}
+
+/// A send that got no answer (the host gave up, the connection broke), or a gateway's in front of the instance, may
+/// have reached Nora: the conversation is read late for her answer. A refusal of the server is not.
+#[test]
+fn a_send_that_got_no_answer_is_read_late_and_a_refusal_is_not() {
+    let finished = || {
+        let mut nora = started_at(1_000.0);
+        poll(&mut nora, 100, json!([{"role": "assistant", "text": "Bonjour !", "ts": 1_001.0}]), json!([]));
+        nora.handle(Input::Tick { now_ms: 2_000 });
+        assert!(!nora.is_busy());
+        nora
+    };
+    for (status, body) in [(0, json!({"exception": "it took too long"})), (504, json!({}))] {
+        let mut nora = finished();
+        let sent = nora.handle(Input::Send("Prends rendez-vous mardi".into()));
+        let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+        nora.handle(Input::Http(HttpResponse { id: post.id, status, body: body.to_string() }));
+        assert!(!nora.is_busy() && nora.reads_late(), "{status}");
+        let answer = json!({"role": "assistant", "text": "C'est noté pour mardi.", "ts": 1_100.0});
+        poll(&mut nora, 20_000, json!([answer]), json!([]));
+        assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("C'est noté pour mardi."), "{status}");
+        assert!(!nora.is_busy() && nora.last_error().is_none(), "{status}");
+    }
+    let mut refused = finished();
+    let sent = refused.handle(Input::Send("Prends rendez-vous mardi".into()));
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    let inner = serde_json::to_string(&json!({"message": "Not permitted"})).unwrap();
+    let body = json!({"_server_messages": serde_json::to_string(&vec![inner]).unwrap()}).to_string();
+    refused.handle(Input::Http(HttpResponse { id: post.id, status: 403, body }));
+    assert!(!refused.is_busy() && !refused.reads_late());
+    // A send the host never answers at all: no read goes out meanwhile, the clock ends the wait.
+    let mut lost = finished();
+    lost.handle(Input::Send("Prends rendez-vous mardi".into()));
+    lost.handle(Input::Tick { now_ms: 481_000 });
+    assert!(lost.is_busy());
+    lost.handle(Input::Tick { now_ms: 482_000 });
+    assert_eq!(lost.failure(), Some(&NoraError::Timeout));
+    assert!(lost.reads_late());
 }
 
 /// A failure while Nora is awaited keeps its kind for the host's words, and the next read that works clears it.

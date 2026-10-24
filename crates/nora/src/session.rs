@@ -18,6 +18,15 @@ use crate::reply::instance_path;
 /// What Nora is told about an action that will not run because the user stopped it.
 const STOPPED: &str = "the user stopped Nora";
 
+/// What Nora is told about an action that comes for a turn the pane gave up on (it told the person she did not answer in
+/// time): nothing is done in the document the person may no longer watch, or even have open (a pane closed since).
+const LATE: &str = "the pane had stopped waiting for this turn and told the person you did not answer in time: nothing was \
+done in the document. Say so in your reply; they will ask again";
+
+/// How long past the silence a read the host never answers is waited for, before the turn is given up on anyway: more
+/// than the hosts' own limit on a call (180 s in the Drive's page, 200 s in NeoMail).
+const UNANSWERED_READ_MS: u64 = 240_000;
+
 /// How a session behaves. The defaults suit an editor talking to a Neoffice instance.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -30,9 +39,19 @@ pub struct SessionConfig {
     pub poll_mid_ms: u64,
     /// The same after that. A business desk answers 10 to 70 seconds after its acknowledgement.
     pub poll_slow_ms: u64,
-    /// How long without a reply or an action before Nora is given up on. Eight minutes, as the
-    /// desk's chat waits: a worker retried after a crash answered after three and a half.
+    /// How long without a reply, an action or a new card before Nora is given up on. Eight minutes, as the
+    /// desk's chat waits: a worker retried after a crash answered after three and a half. Time alone never ends a
+    /// turn whose conversation can be read: a read made after that long must bring nothing (a clock that jumps, a
+    /// tab in the background that draws no frame or a machine too busy to draw, would otherwise end a turn whose
+    /// answer waits on the server).
     pub max_silence_ms: u64,
+    /// How long after the start of a turn given up on (silence, or a message whose send got no answer) the session
+    /// still reads the conversation, for an answer that comes late: its replies and cards are shown as they come, and
+    /// the failure is taken back; an action is refused (the person was told to ask again, and may have closed the
+    /// pane). Thirty minutes, as long as Nora's gateway lets a turn run without news.
+    pub late_read_ms: u64,
+    /// Time between two reads while the session reads late.
+    pub poll_late_ms: u64,
     /// How long the turn stays open after the final reply, for the actions queued with it.
     pub settle_ms: u64,
     /// Lowercase phrases that mark an acknowledgement rather than an answer. Defaults to
@@ -52,6 +71,8 @@ impl Default for SessionConfig {
             poll_mid_ms: 1_000,
             poll_slow_ms: 3_000,
             max_silence_ms: 480_000,
+            late_read_ms: 1_800_000,
+            poll_late_ms: 15_000,
             settle_ms: 1_500,
             ack_anchors: protocol::ACK_ANCHORS.iter().map(|anchor| anchor.to_string()).collect(),
             instance_origin: None,
@@ -201,6 +222,20 @@ pub struct NoraSession {
     refuse_older_actions: bool,
     /// The cards of this conversation, in the order they came.
     cards: Vec<ShownCard>,
+    /// When the read of the replies in flight was sent.
+    read_sent_ms: Option<u64>,
+    /// When the last read of the replies that came back with nothing new (or failed) was sent: made after the
+    /// deadline, it is what says Nora is silent ([`SessionConfig::max_silence_ms`]).
+    quiet_read_ms: Option<u64>,
+    /// Until when the session reads late, for the turn it gave up on ([`SessionConfig::late_read_ms`]).
+    late_until_ms: Option<u64>,
+    /// The server time of the send of a turn given up on while it was read late, once another message is sent: that
+    /// turn's replies still to come are new too, and they are not the answer to the message sent after it.
+    late_since: Option<f64>,
+    /// Whether the server took the last message (its send was answered): `sent_at` is then that message's.
+    send_answered: bool,
+    /// Where the last message is in the transcript.
+    turn_index: usize,
 }
 
 impl NoraSession {
@@ -229,6 +264,12 @@ impl NoraSession {
             outcome: None,
             refuse_older_actions: false,
             cards: Vec::new(),
+            read_sent_ms: None,
+            quiet_read_ms: None,
+            late_until_ms: None,
+            late_since: None,
+            send_answered: false,
+            turn_index: 0,
         }
     }
 
@@ -274,6 +315,13 @@ impl NoraSession {
         self.busy
     }
 
+    /// Whether the session still reads the conversation for the turn it gave up on, for an answer that comes late
+    /// ([`SessionConfig::late_read_ms`]): its replies and cards are shown as they come, and the failure is taken back.
+    /// The session is not busy meanwhile: the person may write again.
+    pub fn reads_late(&self) -> bool {
+        self.late_until_ms.is_some()
+    }
+
     /// The last failure, to show in the panel. A successful read clears it.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
@@ -316,9 +364,19 @@ impl NoraSession {
     }
 
     /// The time at which the host should send the next [`Input::Tick`], when the session is
-    /// waiting for something; `None` when it is idle and needs nothing.
+    /// waiting for something (an answer, or a late one: [`Self::reads_late`]); `None` when it is idle and needs
+    /// nothing.
     pub fn next_wake_ms(&self) -> Option<u64> {
-        if self.busy { Some(self.next_poll_ms.unwrap_or(self.now_ms).max(self.now_ms)) } else { None }
+        if self.busy {
+            Some(self.next_poll_ms.unwrap_or(self.now_ms).max(self.now_ms))
+        } else {
+            self.late_until_ms.map(|until| {
+                let due = self.next_poll_ms.unwrap_or(until);
+                // A late read on its way: the host wakes the window when it answers; until then, a look now and then.
+                let due = if self.polling() && due <= self.now_ms { self.now_ms.saturating_add(self.cfg.poll_late_ms) } else { due };
+                due.min(until).max(self.now_ms)
+            })
+        }
     }
 
     fn new_id(&mut self) -> u64 {
@@ -341,6 +399,11 @@ impl NoraSession {
         if text.is_empty() {
             return;
         }
+        // A message sent while the turn before is read late: that turn's replies still to come are shown too.
+        self.late_since = if self.late_until_ms.take().is_some() { self.sent_at } else { None };
+        self.send_answered = false;
+        self.quiet_read_ms = None;
+        self.turn_index = self.transcript.len();
         self.transcript.push(ChatMessage::user(text.clone()));
         self.busy = true;
         self.outcome = None;
@@ -360,6 +423,7 @@ impl NoraSession {
     fn on_tick(&mut self, now_ms: u64, out: &mut Vec<Output>) {
         self.now_ms = now_ms;
         if !self.busy {
+            self.read_late(now_ms, out);
             return;
         }
         let nothing_running = self.running.is_empty() && self.waiting.is_empty();
@@ -372,21 +436,90 @@ impl NoraSession {
             self.finish(out);
             return;
         }
-        // ...or nothing came for too long (an acknowledgement alone is not an answer). A call the host
-        // never answered does not hold this back: only an action running or waiting for the user does.
-        if nothing_running && now_ms.saturating_sub(self.last_activity_ms) >= self.cfg.max_silence_ms {
-            self.fail(NoraError::Timeout, out);
+        // ...or nothing came for too long (an acknowledgement alone is not an answer), as a read made since says. A
+        // call the host never answered holds this back a little only: an action running or waiting for the user does.
+        if nothing_running && self.silent(now_ms) {
+            self.give_up(NoraError::Timeout, out);
             return;
         }
         if let Some(thread) = self.thread_id.clone()
             && self.next_poll_ms.is_some_and(|due| now_ms >= due)
             && !self.polling()
         {
-            let messages = self.request(protocol::GET_MESSAGES, thread_body(&thread), Pending::Messages);
-            let actions = self.request(protocol::GET_ACTIONS, thread_body(&thread), Pending::Actions);
-            out.push(messages);
-            out.push(actions);
+            self.read(&thread, out);
             self.next_poll_ms = Some(now_ms + self.poll_delay(now_ms));
+        }
+    }
+
+    /// One read of the replies and of the action queue.
+    fn read(&mut self, thread: &str, out: &mut Vec<Output>) {
+        let messages = self.request(protocol::GET_MESSAGES, thread_body(thread), Pending::Messages);
+        let actions = self.request(protocol::GET_ACTIONS, thread_body(thread), Pending::Actions);
+        out.push(messages);
+        out.push(actions);
+        self.read_sent_ms = Some(self.now_ms);
+    }
+
+    /// Whether Nora has said nothing for [`SessionConfig::max_silence_ms`]. Time alone does not say it while the
+    /// conversation can be read: a clock that jumps (a tab in the background draws no frame, nor a machine too busy
+    /// to draw, and the next frame comes minutes later) would end a turn whose answer waits on the server. A read
+    /// sent after the deadline must have come back with nothing; a read the host never answers holds this back by
+    /// [`UNANSWERED_READ_MS`] at most.
+    fn silent(&self, now_ms: u64) -> bool {
+        let deadline = self.last_activity_ms.saturating_add(self.cfg.max_silence_ms);
+        if now_ms < deadline {
+            return false;
+        }
+        // With no conversation to read yet, or a message whose send is unanswered (no read goes out meanwhile), time says it.
+        let sending = self.inflight.values().any(|pending| matches!(pending, Pending::Send));
+        if self.thread_id.is_none() || sending || self.quiet_read_ms.is_some_and(|sent| sent >= deadline) {
+            return true;
+        }
+        self.polling() && self.read_sent_ms.is_some_and(|sent| now_ms >= sent.max(deadline).saturating_add(UNANSWERED_READ_MS))
+    }
+
+    /// The turn is given up on: the failure is shown, and while the server may still finish the turn (it did, with a
+    /// machine too busy to draw), the conversation is read on, slowly, for an answer that comes late.
+    fn give_up(&mut self, error: NoraError, out: &mut Vec<Output>) {
+        self.fail(error, out);
+        let until = self.turn_started_ms.saturating_add(self.cfg.late_read_ms);
+        if self.thread_id.is_some() && self.now_ms < until {
+            self.late_until_ms = Some(until);
+            self.next_poll_ms = Some(self.now_ms.saturating_add(self.cfg.poll_late_ms));
+        }
+    }
+
+    /// A read of the turn given up on, when one is due, until [`SessionConfig::late_read_ms`] has passed.
+    fn read_late(&mut self, now_ms: u64, out: &mut Vec<Output>) {
+        let Some(until) = self.late_until_ms else {
+            return;
+        };
+        if now_ms >= until {
+            self.late_until_ms = None;
+            self.next_poll_ms = None;
+            return;
+        }
+        if let Some(thread) = self.thread_id.clone()
+            && self.next_poll_ms.is_some_and(|due| now_ms >= due)
+            && !self.polling()
+        {
+            self.read(&thread, out);
+            self.next_poll_ms = Some(now_ms.saturating_add(self.cfg.poll_late_ms));
+        }
+    }
+
+    /// A reply or a new card came for the turn given up on: it was not over. Its answer or a new card takes the failure
+    /// shown back (the turn's outcome stays a failure: the pane did give up); an acknowledgement alone leaves it, for
+    /// nothing else may come. Once its answer is in, one more read for what comes with it, and the late reading ends.
+    fn late_news(&mut self, answered: bool, new_card: bool) {
+        if answered || new_card {
+            self.last_error = None;
+            self.last_failure = None;
+        }
+        if answered {
+            let last = self.now_ms.saturating_add(self.cfg.settle_ms);
+            self.next_poll_ms = Some(last);
+            self.late_until_ms = self.late_until_ms.map(|until| until.min(last.saturating_add(self.cfg.poll_late_ms)));
         }
     }
 
@@ -427,26 +560,49 @@ impl NoraSession {
                     Some(thread) => {
                         self.thread_id = Some(thread);
                         self.sent_at = sent_at_of(&message);
+                        self.send_answered = true;
                         self.next_poll_ms = Some(self.now_ms);
                         self.last_activity_ms = self.now_ms;
+                        // While this message was on its way, the turn given up on before it may have sent replies: those
+                        // stamped after the server took this one answer it.
+                        if self.late_since.is_some()
+                            && self.final_seen_ms.is_none()
+                            && self.transcript.iter().skip(self.turn_index + 1).any(|reply| self.answers_this_turn(reply))
+                        {
+                            self.final_seen_ms = Some(self.now_ms);
+                        }
                         out.push(Output::Changed);
                     }
                     None => self.fail(NoraError::Malformed("no `thread_id` in the answer".into()), out),
                 }
             }
+            // A send that got no answer, or a gateway's, may have reached Nora all the same: read late for her answer.
+            (Pending::Send, Err(error)) if may_have_reached(&error) => self.give_up(error, out),
             (Pending::Send, Err(error)) => self.fail(error, out),
             (Pending::Messages, Ok(message)) => {
-                self.last_error = None;
-                self.last_failure = None;
-                self.absorb_replies(&message, out);
+                // A read while the session reads late leaves the failure shown, unless something came.
+                if self.busy {
+                    self.last_error = None;
+                    self.last_failure = None;
+                }
+                if !self.absorb_replies(&message, out) {
+                    self.quiet_read_ms = self.read_sent_ms;
+                }
             }
             (Pending::Actions, Ok(message)) => {
-                self.last_error = None;
-                self.last_failure = None;
+                if self.busy {
+                    self.last_error = None;
+                    self.last_failure = None;
+                }
                 let stale = self.refuse_older_actions && queued_at_of(&message).zip(self.sent_at).is_some_and(|(queued, sent)| queued < sent);
+                // An action for a turn the pane gave up on (read late, or answered after the late reading ended) is never
+                // run: the person was told to ask again.
+                let given_up = !self.busy;
                 for action in parse_actions(&message) {
                     if stale {
                         self.refuse(action, STOPPED, out);
+                    } else if given_up {
+                        self.refuse(action, LATE, out);
                     } else {
                         self.last_activity_ms = self.now_ms;
                         self.handle_action(action, out);
@@ -458,10 +614,17 @@ impl NoraSession {
                     self.refuse(action, STOPPED, out);
                 }
             }
-            (Pending::Messages | Pending::Actions, Err(error)) => {
-                self.last_error = Some(error.to_string());
-                self.last_failure = Some(error);
-                out.push(Output::Changed);
+            (kind @ (Pending::Messages | Pending::Actions), Err(error)) => {
+                // A read that failed came back too: made after the deadline, it ends a turn the server no longer answers.
+                if matches!(kind, Pending::Messages) {
+                    self.quiet_read_ms = self.read_sent_ms;
+                }
+                // While the session reads late, the failure shown stays the turn's.
+                if self.busy {
+                    self.last_error = Some(error.to_string());
+                    self.last_failure = Some(error);
+                    out.push(Output::Changed);
+                }
             }
             (Pending::CardAnswer(token), Ok(message)) => {
                 self.last_error = None;
@@ -503,12 +666,19 @@ impl NoraSession {
     /// that result goes to Nora as it is, and can be undone. A first message whose thread the server
     /// has not named yet leaves it behind; the next message opens another one.
     fn on_cancel(&mut self, out: &mut Vec<Output>) {
+        // A Stop while the turn given up on is read late ends that reading, and what that turn still queues is refused
+        // when the next message reads it, as after a Stop of a turn that runs.
+        if self.late_until_ms.take().is_some() {
+            self.next_poll_ms = None;
+            self.refuse_older_actions = true;
+        }
         if !self.busy {
             return;
         }
         self.busy = false;
         self.next_poll_ms = None;
         self.final_seen_ms = None;
+        self.late_until_ms = None;
         self.outcome = Some(TurnEnd::Stopped);
         self.refuse_older_actions = true;
         self.anchor_cards();
@@ -539,17 +709,25 @@ impl NoraSession {
 
     /// Adds the replies the transcript has not seen. The server list holds Nora's replies only, in the
     /// order they came; the user's own messages are added when sent. An acknowledgement is shown and
-    /// the wait goes on; the first reply that is an answer ends it.
-    fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) {
+    /// the wait goes on; the first reply that is an answer ends it. Whether anything came (a reply, a new card): for a
+    /// turn given up on, it is shown and the failure taken back ([`Self::late_news`]).
+    fn absorb_replies(&mut self, message: &Value, out: &mut Vec<Output>) -> bool {
         let (replies, cards) = parse_messages(message);
         let replies: Vec<ChatMessage> = replies.into_iter().filter(|reply| reply.role != Role::User).collect();
         let fresh = self.fresh_replies(replies);
-        let mut changed = !fresh.is_empty();
-        if changed {
+        let new_card = self.has_new_card(&cards);
+        let news = !fresh.is_empty() || new_card;
+        if news {
             self.last_activity_ms = self.now_ms;
         }
+        // The session reads late for a turn it gave up on (never while busy): what comes is shown, not waited for.
+        let late = self.late_until_ms.is_some();
+        let mut answered_late = false;
+        let mut changed = !fresh.is_empty();
         for reply in fresh {
-            if self.final_seen_ms.is_none() && !self.is_interim(&reply) {
+            if late {
+                answered_late |= !self.is_interim(&reply);
+            } else if self.final_seen_ms.is_none() && self.answers_this_turn(&reply) {
                 self.final_seen_ms = Some(self.now_ms);
             }
             if !is_hidden(&reply) {
@@ -558,9 +736,41 @@ impl NoraSession {
         }
         // After the replies, so that a card that came with its reply is shown under it.
         changed |= self.absorb_cards(&cards);
+        if late && news {
+            self.late_news(answered_late, new_card);
+            changed = true;
+        }
         if changed {
             out.push(Output::Changed);
         }
+        news
+    }
+
+    /// Whether a reply of this turn is its answer: not an acknowledgement, and, when a turn given up on before it may
+    /// still send replies (`late_since`), stamped after the server took this message (until it has said when,
+    /// a reply is that turn's).
+    fn answers_this_turn(&self, reply: &ChatMessage) -> bool {
+        if reply.role == Role::User || self.is_interim(reply) {
+            return false;
+        }
+        if self.late_since.is_none() {
+            return true;
+        }
+        match (self.send_answered, self.sent_at, reply.ts) {
+            (false, ..) => false,
+            (true, Some(sent), Some(ts)) => ts > sent,
+            (true, ..) => true,
+        }
+    }
+
+    /// Whether the server's list holds a card of this conversation not shown yet (a new card is news; a card shown
+    /// that changes its state is not).
+    fn has_new_card(&self, cards: &[Value]) -> bool {
+        let Some(thread) = self.thread_id.as_deref() else { return false };
+        cards
+            .iter()
+            .filter_map(Card::from_json)
+            .any(|card| card.conversation == thread && !self.cards.iter().any(|shown| shown.card.token == card.token))
     }
 
     /// Takes in the cards of THIS conversation (the server's list also holds the person's pending proposals of every
@@ -592,7 +802,9 @@ impl NoraSession {
     /// counting positions then hides an answer that lands as the only message left. Without it
     /// (an older server) the positions are counted, and the count never goes down.
     fn fresh_replies(&mut self, replies: Vec<ChatMessage>) -> Vec<ChatMessage> {
-        match self.sent_at {
+        // A turn given up on before the last message may still send replies: those stamped after its own send are new.
+        let since = self.sent_at.map(|sent| self.late_since.map_or(sent, |late| late.min(sent)));
+        match since {
             Some(sent_at) => {
                 replies.into_iter().filter(|reply| reply.ts.is_none_or(|ts| ts > sent_at) && self.seen.insert(reply_key(reply))).collect()
             }
@@ -731,6 +943,12 @@ impl NoraSession {
         self.outcome = None;
         self.refuse_older_actions = false;
         self.cards.clear();
+        self.read_sent_ms = None;
+        self.quiet_read_ms = None;
+        self.late_until_ms = None;
+        self.late_since = None;
+        self.send_answered = false;
+        self.turn_index = 0;
         out.push(Output::Changed);
     }
 
@@ -794,6 +1012,12 @@ impl NoraSession {
             TurnEnd::Stopped => JobState::Cancelled,
         })
     }
+}
+
+/// Whether a send that failed may have reached Nora all the same: no answer came (the host gave up, the connection
+/// broke), or a gateway in front of the instance answered for it (502, 503, 504, 408) while the instance went on.
+fn may_have_reached(error: &NoraError) -> bool {
+    matches!(error, NoraError::Unreachable(_)) || matches!(error.status(), Some(408 | 502 | 503 | 504))
 }
 
 /// A reply with nothing to show: empty, or the marker Nora uses for "nothing to say".
