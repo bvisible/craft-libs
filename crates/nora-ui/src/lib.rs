@@ -206,6 +206,10 @@ pub struct NoraPanel {
     pub labels: NoraLabels,
     /// Under a turn lost to a page that ran nothing: what is said, and the button that sends the request again.
     pub resume_words: ResumeWords,
+    /// Set when the app does not carry the person's answer to a card (it drops [`PanelAction::AnswerCard`] and
+    /// [`PanelAction::ChooseOnCard`]): why, in one line, shown on a card that waits for the person in place of its
+    /// buttons, which would do nothing. `None` (the default): the buttons.
+    pub cards_unanswered: Option<String>,
     pub style: NoraStyle,
     /// Set when the host has no way to reach Nora: the panel then says why instead of offering a
     /// text box that would swallow the message.
@@ -471,8 +475,11 @@ impl NoraPanel {
                 if let Some(result) = card.result.as_deref().filter(|_| !waits) {
                     ui.add(Label::new(RichText::new(result).weak()).wrap());
                 }
+                if waits && let Some(why) = &self.cards_unanswered {
+                    ui.add(Label::new(RichText::new(why.as_str()).weak()).wrap());
+                }
                 ui.horizontal_wrapped(|ui| {
-                    if waits {
+                    if waits && self.cards_unanswered.is_none() {
                         let refuse = card.refuse_label.as_deref().unwrap_or(self.labels.refuse.as_str());
                         if card.choices.is_empty() {
                             let confirm = card.confirm_label.as_deref().unwrap_or(self.labels.allow.as_str());
@@ -841,6 +848,7 @@ mod tests {
             nora.handle(Input::Send("Hello".into()));
             nora.handle(Input::Tick { now_ms: 10 });
             nora.handle(Input::Tick { now_ms: 500_000 });
+            nora.handle(Input::Tick { now_ms: 500_050 });
             assert!(nora.last_failure().is_some(), "nothing came: the wait ended");
             nora
         };
@@ -1111,6 +1119,32 @@ mod tests {
             Input::AnswerCard { token, approve: true } if token == "c2"
         ));
         assert!(matches!(PanelAction::OpenLink("/x".into()).into_input(), Input::OpenLink(url) if url == "/x"));
+    }
+
+    /// An app that does not carry a card's answer (NeoPDF) says why in one line instead of buttons that do nothing; the
+    /// card's words and its Open stay.
+    #[test]
+    fn where_the_app_takes_no_answer_a_waiting_card_says_why_and_has_no_buttons() {
+        let cards = json!([{ "token": "c2", "kind": "Template", "status": "Pending", "title": "Modèle de lettre",
+            "conversation_id": "t1",
+            "payload": { "summary": "« Lettre.docx » devient le modèle de lettre.", "confirm_label": "Confirmer",
+                         "refuse_label": "Annuler", "choices": [{ "id": "Bureau", "label": "Bureau" }] } }]);
+        let mut h = harness(replied_with("Confirmez sur la carte.", cards));
+        h.state_mut().panel.cards_unanswered = Some("Answer this card in Nora's chat: this editor does not take it.".into());
+        h.run();
+        assert!(h.query_by_label("« Lettre.docx » devient le modèle de lettre.").is_some(), "the card is read");
+        assert!(h.query_by_label("Answer this card in Nora's chat: this editor does not take it.").is_some());
+        for button in ["Confirmer", "Annuler", "Bureau"] {
+            assert!(h.query_by_label(button).is_none(), "{button}");
+        }
+        assert!(h.state().actions.is_empty());
+        // A card that waits for nobody shows no such line.
+        let done = json!([{ "token": "c1", "kind": "Document", "status": "Executed", "title": "Brouillon",
+            "conversation_id": "t1", "payload": {} }]);
+        let mut h = harness(replied_with("C'est prêt.", done));
+        h.state_mut().panel.cards_unanswered = Some("Answer this card in Nora's chat: this editor does not take it.".into());
+        h.run();
+        assert!(h.query_by_label("Answer this card in Nora's chat: this editor does not take it.").is_none());
     }
 
     #[test]

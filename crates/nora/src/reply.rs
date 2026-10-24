@@ -31,17 +31,16 @@ pub fn segments(text: &str) -> Vec<Segment> {
     let mut rest = text;
     while let Some(open) = rest.find('[') {
         let after = &rest[open + 1..];
-        let link = after.find(']').and_then(|close| {
+        // A label holds no `[` nor line break, an address no space nor `(`: each search stops at the first of them, so
+        // that no `[` makes the scan run to the end of the reply again (a reply full of `[` was read in quadratic time
+        // on every frame, and the window froze). What is read is the same as before.
+        let close = after.find(|c| matches!(c, '[' | ']' | '\n')).filter(|close| after.as_bytes()[*close] == b']');
+        let link = close.and_then(|close| {
             let label = &after[..close];
             let tail = after[close + 1..].strip_prefix('(')?;
-            let end = tail.find(')')?;
+            let end = tail.find(|c: char| c == ')' || c == '(' || c.is_whitespace()).filter(|end| tail.as_bytes()[*end] == b')')?;
             let url = &tail[..end];
-            let well_formed = !label.is_empty()
-                && !label.contains('[')
-                && !label.contains('\n')
-                && !url.is_empty()
-                && !url.contains(char::is_whitespace)
-                && !url.contains('(');
+            let well_formed = !label.is_empty() && !url.is_empty();
             // How much of `rest` the link takes: `[`, the label, `](`, the address, `)`.
             well_formed.then(|| (label.to_string(), url.to_string(), open + 1 + close + 2 + end + 1))
         });
@@ -134,6 +133,31 @@ mod tests {
         }
         // The last bracket before a well-formed link opens it.
         assert_eq!(segments("[a [b](/c)"), vec![text("[a "), link("b", "/c")]);
+    }
+
+    /// A long reply full of `[` (a table pasted, a log) is read in linear time: read on every frame, the quadratic
+    /// search froze the window. 50 000 characters, in three shapes that each made a search run to the end again.
+    #[test]
+    fn a_long_reply_full_of_brackets_is_read_at_once() {
+        let shapes = ["[".repeat(50_000), "[a".repeat(25_000), format!("[a]({}", "b[".repeat(25_000)), "[a](b(".repeat(8_333), "[x]".repeat(16_666)];
+        let started = std::time::Instant::now();
+        for reply in &shapes {
+            let read = segments(reply);
+            let joined: String = read
+                .iter()
+                .map(|s| match s {
+                    Segment::Text(t) => t.clone(),
+                    Segment::Link { label, url } => format!("[{label}]({url})"),
+                })
+                .collect();
+            assert_eq!(&joined, reply, "nothing lost, nothing added");
+            assert!(read.iter().all(|s| matches!(s, Segment::Text(_))), "no link in these");
+        }
+        // The quadratic search took tens of seconds here (a debug build); the linear one, milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        // A well-formed link among brackets is still one.
+        let mixed = format!("{}[Ouvrir](/drive/f/abc){}", "[".repeat(20_000), "]".repeat(20_000));
+        assert!(segments(&mixed).contains(&link("Ouvrir", "/drive/f/abc")));
     }
 
     #[test]

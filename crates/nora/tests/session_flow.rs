@@ -172,8 +172,11 @@ fn silence_ends_the_wait_with_an_error_after_eight_minutes() {
     // The read still on its way left before the deadline: it says nothing of the silence after it...
     nora.handle(Input::Tick { now_ms: 480_100 });
     assert!(nora.is_busy());
-    // ...but even with a read the host never answers, the wait does end.
-    let outputs = nora.handle(Input::Tick { now_ms: 720_100 });
+    // ...but even with a read the host never answers, the wait does end (the tick back from a gap without frames
+    // judges nothing: the one after it does).
+    nora.handle(Input::Tick { now_ms: 720_100 });
+    assert!(nora.is_busy());
+    let outputs = nora.handle(Input::Tick { now_ms: 720_150 });
     assert!(!nora.is_busy());
     assert_eq!(nora.last_error(), Some("Nora did not answer in time"));
     assert_eq!(nora.failure(), Some(&NoraError::Timeout));
@@ -1328,4 +1331,62 @@ fn a_turn_read_late_that_lost_an_action_offers_to_resume_it() {
     given_up(&mut nora);
     poll_queue(&mut nora, 495_200, json!({"actions": [], "missed": 1_010.0, "now": 1_495.0}));
     assert_eq!(nora.resumable(), Some("Bonjour"));
+}
+
+/// An action asked for a turn the pane gave up on never plays in the next one: not while the server has not yet said it
+/// took the new message, nor once it has, when the action was queued before it (24.10.2026).
+#[test]
+fn an_action_of_a_turn_given_up_on_never_plays_in_the_next_one() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    let sent = nora.handle(Input::Send("Encore".into()));
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    // The late reading's read is due: it brings the given-up turn's action while the new message is on its way.
+    let early = poll_queue(&mut nora, 495_300, json!({"actions": [type_text("a1")], "queued_at": [1_490.0], "now": 1_495.0}));
+    assert!(documents(&early).is_empty() && refused_with(&early, "a1").contains("another message"));
+    nora.handle(ok(&post, json!({"thread_id": "t1", "sent_at": 1_500.0})));
+    let older = poll_queue(&mut nora, 496_000, json!({"actions": [type_text("a2")], "queued_at": [1_499.0], "now": 1_500.5}));
+    assert!(documents(&older).is_empty() && refused_with(&older, "a2").contains("another message"));
+    // This turn's own action runs, and the turn is not lost for the others.
+    let own = poll_queue(&mut nora, 499_000, json!({"actions": [type_text("b1")], "queued_at": [1_501.0], "now": 1_501.5}));
+    assert_eq!(documents(&own).len(), 1);
+    assert_eq!(nora.resumable(), None);
+    // A server that keeps no time per action: the queue's last write says it.
+    let mut old = started_at(1_000.0);
+    given_up(&mut old);
+    let sent = old.handle(Input::Send("Encore".into()));
+    old.handle(ok(request_to(&sent, protocol::POST_MESSAGE), json!({"thread_id": "t1", "sent_at": 1_500.0})));
+    let stale = poll_queue(&mut old, 495_300, json!({"actions": [type_text("a3")], "timestamp": 1_499.0}));
+    assert!(documents(&stale).is_empty() && refused_with(&stale, "a3").contains("another message"));
+}
+
+/// The page went quiet right after the person sent a request, before the send's answer was handed to the session: back
+/// from the gap, the host ticks first, then hands it over. Nothing is given up on the clock at that tick; the answer is
+/// read, the conversation is read, and what waited too long is the turn's loss (24.10.2026, essai on osiris).
+#[test]
+fn back_from_a_gap_the_answers_that_waited_in_the_page_are_read_before_anything_is_given_up() {
+    let mut nora = session();
+    nora.handle(Input::Tick { now_ms: 100 });
+    let sent = nora.handle(Input::Send("Écris 42 dans B2".into()));
+    let start = request_to(&sent, protocol::START_OR_RESUME_THREAD).clone();
+    // No tick between the send and the gap: the person sent, then left the tab.
+    nora.handle(Input::Tick { now_ms: 480_200 });
+    assert!(nora.is_busy() && nora.failure().is_none(), "the send's answer waits in the page");
+    nora.handle(ok(&start, json!({"thread_id": "t1", "sent_at": 1_000.0})));
+    poll_queue(&mut nora, 480_250, json!({"actions": [], "missed": 1_002.0, "now": 1_480.0}));
+    poll(&mut nora, 483_300, json!([{"role": "assistant", "text": "Rien n'a été modifié.", "ts": 1_481.0}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 485_000 });
+    assert!(!nora.is_busy() && nora.failure().is_none());
+    assert_eq!(nora.resumable(), Some("Écris 42 dans B2"));
+    // The same with a read on its way across the gap, and no time at all from the server: nothing given up at the
+    // tick back, the read's answer is judged with the gap.
+    let mut reading = started();
+    let outputs = reading.handle(Input::Tick { now_ms: 100 });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    reading.handle(Input::Tick { now_ms: 900_000 });
+    assert!(reading.is_busy() && reading.failure().is_none());
+    reading.handle(ok(&messages, json!({"success": true, "messages": [], "cards": []})));
+    let refused = reading.handle(ok(&queue, json!({"success": true, "actions": [type_text("c1")]})));
+    assert!(documents(&refused).is_empty());
 }

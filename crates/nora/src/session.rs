@@ -23,6 +23,11 @@ const STOPPED: &str = "the user stopped Nora";
 const LATE: &str = "the pane had stopped waiting for this turn and told the person you did not answer in time: nothing was \
 done in the document. Say so in your reply; they will ask again";
 
+/// What Nora is told about an action asked for a turn before the one under way: that turn is over (answered, given up
+/// on, stopped) and the person has sent another message since.
+const EARLIER: &str = "this was asked for a request the person has left: they sent another message since. Nothing was done \
+in the document";
+
 /// What Nora is told about an action of a turn that lost one to a page that ran nothing (a tab in the background, a
 /// computer asleep): it was not done, nor anything after it in that turn; the pane offers the person to resume.
 const FROZEN: &str = "the person's tab was in the background, so the editor could not run this in time: nothing was done \
@@ -256,6 +261,9 @@ pub struct NoraSession {
     /// The turn lost an action to a page that ran nothing: the rest of its actions are refused, and once it is over the
     /// person is offered to resume it ([`Self::resumable`]).
     lost: bool,
+    /// A turn of this conversation was given up on, or lost: from then on an action queued before the turn under way
+    /// is that turn's, and is refused ([`Self::of_an_earlier_turn`]). Until a new conversation.
+    abandoned: bool,
 }
 
 impl NoraSession {
@@ -293,6 +301,7 @@ impl NoraSession {
             watch_ms: None,
             thaw_ms: None,
             lost: false,
+            abandoned: false,
         }
     }
 
@@ -436,7 +445,9 @@ impl NoraSession {
         self.late_since = if self.late_until_ms.take().is_some() { self.sent_at } else { None };
         self.send_answered = false;
         self.quiet_read_ms = None;
-        self.watch_ms = None;
+        // The send's frame is watched from: a page that goes quiet right after it (the person sends, then leaves the tab)
+        // is seen as such at the next tick.
+        self.watch_ms = Some(self.now_ms);
         self.thaw_ms = None;
         self.lost = false;
         self.turn_index = self.transcript.len();
@@ -458,9 +469,11 @@ impl NoraSession {
 
     fn on_tick(&mut self, now_ms: u64, out: &mut Vec<Output>) {
         // A page that drew no frame for `frozen_ms` while Nora worked ran nothing she asked meanwhile.
+        let mut thawing = false;
         if self.busy || self.late_until_ms.is_some() {
             if self.watch_ms.is_some_and(|last| now_ms.saturating_sub(last) >= self.cfg.frozen_ms) {
                 self.thaw_ms = Some(now_ms);
+                thawing = true;
             }
             self.watch_ms = Some(now_ms);
         } else {
@@ -483,7 +496,9 @@ impl NoraSession {
         }
         // ...or nothing came for too long (an acknowledgement alone is not an answer), as a read made since says. A
         // call the host never answered holds this back a little only: an action running or waiting for the user does.
-        if nothing_running && self.silent(now_ms) {
+        // Not at the tick that comes back from a gap: the answers that waited in the page (the send's, a read's) are not
+        // handed over yet, and the clock alone says nothing of them. The next tick, one frame later, judges.
+        if nothing_running && !thawing && self.silent(now_ms) {
             self.give_up(NoraError::Timeout, out);
             return;
         }
@@ -644,11 +659,14 @@ impl NoraSession {
                 // run: the person was told to ask again.
                 let given_up = !self.busy;
                 let waited = self.waited_too_long(&message);
-                for (action, too_long) in parse_actions(&message).into_iter().zip(waited) {
+                let earlier = self.of_an_earlier_turn(&message);
+                for ((action, too_long), earlier) in parse_actions(&message).into_iter().zip(waited).zip(earlier) {
                     if stale {
                         self.refuse(action, STOPPED, out);
                     } else if given_up {
                         self.refuse(action, LATE, out);
+                    } else if earlier {
+                        self.refuse(action, EARLIER, out);
                     } else if too_long || self.lost {
                         self.refuse(action, FROZEN, out);
                     } else {
@@ -699,6 +717,7 @@ impl NoraSession {
     }
 
     fn fail(&mut self, error: NoraError, out: &mut Vec<Output>) {
+        self.abandoned = true;
         self.last_error = Some(error.to_string());
         self.last_failure = Some(error.clone());
         self.outcome = Some(TurnEnd::Failed(error));
@@ -808,9 +827,12 @@ impl NoraSession {
         let (queued, server_now) = waits_of(message);
         let thawed = self.thaw_ms.take();
         let read_before_thaw = thawed.is_some_and(|thaw| self.read_sent_ms.is_some_and(|sent| sent < thaw));
-        let this_turn = |at: Option<f64>| self.sent_at.zip(at).is_none_or(|(sent, at)| at >= sent);
+        // Until the server has said it took this turn's message, `sent_at` is the turn before's: nothing read then is
+        // known to be this turn's.
+        let this_turn = |at: Option<f64>| self.send_answered && self.sent_at.zip(at).is_none_or(|(sent, at)| at >= sent);
         if missed_of(message).is_some_and(|at| this_turn(Some(at))) {
             self.lost = true;
+            self.abandoned = true;
         }
         let limit = self.cfg.frozen_ms as f64 / 1000.0;
         let count = parse_actions(message).len();
@@ -825,8 +847,27 @@ impl NoraSession {
             .collect();
         if waited.iter().enumerate().any(|(index, too_long)| *too_long && this_turn(queued.get(index).copied().flatten())) {
             self.lost = true;
+            self.abandoned = true;
         }
         waited
+    }
+
+    /// For each action of a read of the queue, once a turn of this conversation was given up on or lost, whether it
+    /// was asked for a turn before this one: read while the server has not yet said it took this turn's message (it
+    /// can only be an earlier turn's), or queued before that message (the server's time of each action, else of the
+    /// queue's last write). Never played: a turn the pane gave up on, read late, must not act in the next one, nor a
+    /// lost turn in the one that resumes it.
+    fn of_an_earlier_turn(&self, message: &Value) -> Vec<bool> {
+        let (queued, _) = waits_of(message);
+        let queue_time = queued_at_of(message);
+        let count = parse_actions(message).len();
+        (0..count)
+            .map(|index| {
+                self.abandoned
+                    && (!self.send_answered
+                        || queued.get(index).copied().flatten().or(queue_time).zip(self.sent_at).is_some_and(|(at, sent)| at < sent))
+            })
+            .collect()
     }
 
     /// Whether a reply of this turn is its answer: not an acknowledgement, and, when a turn given up on before it may
@@ -1035,6 +1076,7 @@ impl NoraSession {
         self.watch_ms = None;
         self.thaw_ms = None;
         self.lost = false;
+        self.abandoned = false;
         out.push(Output::Changed);
     }
 
