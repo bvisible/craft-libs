@@ -34,7 +34,7 @@ pub fn segments(text: &str) -> Vec<Segment> {
         // A label holds no `[` nor line break, an address no space nor `(`: each search stops at the first of them, so
         // that no `[` makes the scan run to the end of the reply again (a reply full of `[` was read in quadratic time
         // on every frame, and the window froze). What is read is the same as before.
-        let close = after.find(|c| matches!(c, '[' | ']' | '\n')).filter(|close| after.as_bytes()[*close] == b']');
+        let close = after.find(['[', ']', '\n']).filter(|close| after.as_bytes()[*close] == b']');
         let link = close.and_then(|close| {
             let label = &after[..close];
             let tail = after[close + 1..].strip_prefix('(')?;
