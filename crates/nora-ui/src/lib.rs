@@ -248,7 +248,8 @@ impl NoraPanel {
     pub fn show(&mut self, ui: &mut Ui, session: &NoraSession) -> Vec<PanelAction> {
         let mut actions = Vec::new();
         let colors = Colors::resolve(&self.style, ui.visuals());
-        let id = ui.id().with("nora");
+        // (`make_persistent_id`: the same id as `ui.id().with(…)` on egui 0.36, and not deprecated on 0.37.)
+        let id = ui.make_persistent_id("nora");
         self.header(ui, session, &mut actions);
         ui.separator();
         // The text box is a bottom panel, so that its height follows what is typed in it; the

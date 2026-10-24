@@ -13,7 +13,9 @@ workspace = true
 
 [dependencies]
 craft-nora = { workspace = true }
-egui = { workspace = true }
+# The editors are on egui 0.36 and NeoMail (UCS's MailCraft) on 0.37: the panel takes the one the app has, and is
+# written to the API both share (its CI checks it on 0.37 too). Cargo keeps one egui per app: the one its lock has.
+egui = { version = ">=0.36, <0.38", default-features = false }
 
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }

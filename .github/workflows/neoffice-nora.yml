@@ -4,7 +4,9 @@
 # format, clippy without warnings, tests, and a wasm build (the Nora client core is meant to run in
 # the browser too). `cargo clippy --workspace` is deliberately not used: it fails on upstream code
 # that this fork does not touch. Each check also runs with the crates' features on (craft-nora's
-# `ai-core` speaks upstream's craft-ai-core), so a change of that crate shows here.
+# `ai-core` speaks upstream's craft-ai-core), so a change of that crate shows here. The panel is
+# also built against egui 0.37, the one NeoMail (UCS's MailCraft) is on, while the editors and this
+# workspace are on 0.36: a change that only builds on one of them shows here, not at NeoMail's pin.
 name: Neoffice Nora crates
 
 on:
@@ -60,3 +62,38 @@ jobs:
           key: neoffice-nora-wasm
       - run: cargo check -p craft-nora -p craft-nora-ui --locked --target wasm32-unknown-unknown
       - run: cargo check -p craft-nora -p craft-nora-ui --all-features --locked --target wasm32-unknown-unknown
+  egui-037:
+    name: Nora panel on egui 0.37 (NeoMail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: A crate on egui 0.37 that draws the panel, built without a warning
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/nora-egui-037"
+          mkdir -p "$dir/src"
+          {
+            echo '[package]'
+            echo 'name = "nora-egui-037"'
+            echo 'version = "0.0.0"'
+            echo 'edition = "2024"'
+            echo 'publish = false'
+            echo '[dependencies]'
+            echo "craft-nora = { path = \"$GITHUB_WORKSPACE/crates/nora\" }"
+            echo "craft-nora-ui = { path = \"$GITHUB_WORKSPACE/crates/nora-ui\" }"
+            echo 'egui = { version = "0.37", default-features = false }'
+            echo '[workspace]'
+          } > "$dir/Cargo.toml"
+          echo 'pub fn draw(ui: &mut egui::Ui, panel: &mut craft_nora_ui::NoraPanel, session: &craft_nora::NoraSession) -> usize { panel.show(ui, session).len() }' > "$dir/src/lib.rs"
+          cargo check --manifest-path "$dir/Cargo.toml"
+          cargo check --manifest-path "$dir/Cargo.toml" --target wasm32-unknown-unknown
+          # One egui in that app: the panel took the app's 0.37.
+          cargo tree --manifest-path "$dir/Cargo.toml" -e normal -i egui | tee "$dir/tree.txt"
+          grep -q '^egui v0\.37\.' "$dir/tree.txt"
+          grep -q 'craft-nora-ui' "$dir/tree.txt"
