@@ -288,7 +288,11 @@ impl NoraPanel {
         if self.scroll_to_end {
             area = area.vertical_scroll_offset(self.end_offset);
         }
-        let shown = area.show(ui, |ui| {
+        // Where the view is, as the viewport says it (egui 0.37 keeps the scroll state's offset to itself; this reads the
+        // same on 0.36 and 0.37).
+        let mut at = 0.0;
+        let shown = area.show_viewport(ui, |ui, viewport| {
+            at = viewport.min.y;
             if session.transcript().is_empty() && !session.is_busy() {
                 ui.add_space(ui.spacing().item_spacing.y * 4.0);
                 ui.vertical_centered(|ui| ui.weak(self.labels.empty.as_str()));
@@ -332,7 +336,7 @@ impl NoraPanel {
         });
         let end = (shown.content_size.y - shown.inner_rect.height()).max(0.0);
         // Asked again next frame while the view is short of the end (something came in the same frame).
-        self.scroll_to_end &= shown.state.offset.y < end - 0.5;
+        self.scroll_to_end &= at < end - 0.5;
         self.end_offset = end;
     }
 
