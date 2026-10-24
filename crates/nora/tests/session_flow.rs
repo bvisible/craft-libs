@@ -1182,3 +1182,150 @@ fn a_new_conversation_forgets_its_cards() {
     nora.handle(Input::Reset);
     assert!(nora.cards().is_empty());
 }
+
+// A page that runs nothing (a tab in the background, a computer asleep): what Nora asked meanwhile is refused, the rest
+// of the turn too, and once the turn is over the person is offered to send the same request again (24.10.2026).
+
+fn type_text(callback: &str) -> Value {
+    json!({"action": "doc_type_text", "text": "42", "callback_id": callback})
+}
+
+/// The refusal Nora was told for `callback`, as a string.
+fn refused_with<'a>(outputs: &'a [Output], callback: &str) -> &'a str {
+    refusal_of(outputs, callback).as_str().unwrap_or_default()
+}
+
+#[test]
+fn an_action_that_waited_for_a_page_that_ran_nothing_is_refused_and_the_request_can_be_resumed() {
+    let mut nora = started_at(1_000.0);
+    // The page comes back: the action was queued eight minutes before this read, by the server's clock.
+    let old = poll_queue(&mut nora, 100, json!({"actions": [type_text("c1")], "queued_at": [1_002.0], "now": 1_482.0}));
+    assert!(documents(&old).is_empty(), "never played");
+    assert!(refused_with(&old, "c1").contains("background"));
+    assert!(nora.is_busy() && nora.resumable().is_none(), "offered once the turn is over");
+    // Nora tries again in the same turn: refused too.
+    let again = poll_queue(&mut nora, 600, json!({"actions": [type_text("c2")], "queued_at": [1_483.0], "now": 1_483.5}));
+    assert!(documents(&again).is_empty() && refused_with(&again, "c2").contains("background"));
+    poll(&mut nora, 1_100, json!([{"role": "assistant", "text": "Rien n'a été modifié.", "ts": 1_484.0}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 3_000 });
+    assert!(!nora.is_busy());
+    assert_eq!(nora.resumable(), Some("Bonjour"));
+    // The person's click sends the same request again: a new turn, whose actions run.
+    let sent = nora.handle(Input::Send(nora.resumable().unwrap().to_string()));
+    assert_eq!(nora.resumable(), None);
+    let post = request_to(&sent, protocol::POST_MESSAGE).clone();
+    assert_eq!(post.body["message"], "Bonjour");
+    nora.handle(ok(&post, json!({"thread_id": "t1", "sent_at": 1_600.0})));
+    let fresh = poll_queue(&mut nora, 3_500, json!({"actions": [type_text("c3")], "queued_at": [1_601.0], "now": 1_601.5}));
+    assert_eq!(documents(&fresh).len(), 1);
+}
+
+#[test]
+fn an_action_read_at_once_runs_as_before() {
+    let mut nora = started_at(1_000.0);
+    let outputs = poll_queue(&mut nora, 100, json!({"actions": [type_text("c1")], "queued_at": [1_001.0], "now": 1_002.0}));
+    let played = documents(&outputs);
+    assert_eq!(played.len(), 1);
+    nora.handle(Input::DocumentResult { id: played[0].id, result: Ok(json!({"ok": true})) });
+    poll(&mut nora, 600, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_003.0}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 3_000 });
+    assert!(!nora.is_busy() && nora.resumable().is_none());
+}
+
+/// The queue expired before the page read it (five minutes): the server says so once, and the turn is lost.
+#[test]
+fn a_queue_that_expired_unread_loses_the_turn() {
+    let mut nora = started_at(1_000.0);
+    poll_queue(&mut nora, 100, json!({"actions": [], "missed": 1_002.0, "now": 1_490.0}));
+    let late = poll_queue(&mut nora, 600, json!({"actions": [type_text("c2")], "queued_at": [1_490.5], "now": 1_491.0}));
+    assert!(documents(&late).is_empty() && refused_with(&late, "c2").contains("background"));
+    poll(&mut nora, 1_100, json!([{"role": "assistant", "text": "Je n'ai pas pu écrire.", "ts": 1_492.0}]), json!([]));
+    nora.handle(Input::Tick { now_ms: 3_000 });
+    assert_eq!(nora.resumable(), Some("Bonjour"));
+    // One that expired before this turn's send is another turn's: this one is not lost.
+    let mut other = started_at(1_000.0);
+    poll_queue(&mut other, 100, json!({"actions": [], "missed": 900.0, "now": 1_001.0}));
+    poll(&mut other, 600, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_002.0}]), json!([]));
+    other.handle(Input::Tick { now_ms: 3_000 });
+    assert_eq!(other.resumable(), None);
+}
+
+/// An action that waited since a turn before this one is refused, never played; this turn is not lost for it.
+#[test]
+fn an_old_action_of_a_turn_before_is_refused_without_losing_this_one() {
+    let mut nora = started_at(1_000.0);
+    let outputs = poll_queue(&mut nora, 100, json!({"actions": [type_text("c0"), type_text("c1")], "queued_at": [800.0, 1_001.0], "now": 1_002.0}));
+    let played = documents(&outputs);
+    assert_eq!(played.len(), 1, "this turn's runs");
+    assert!(refused_with(&outputs, "c0").contains("background"));
+    poll(&mut nora, 600, json!([{"role": "assistant", "text": "C'est fait.", "ts": 1_003.0}]), json!([]));
+    nora.handle(Input::DocumentResult { id: played[0].id, result: Ok(json!({"ok": true})) });
+    nora.handle(Input::Tick { now_ms: 3_000 });
+    assert_eq!(nora.resumable(), None);
+}
+
+/// A server that says no times: a page that drew no frame for a minute while Nora worked ran nothing meanwhile; the
+/// first read after it is refused.
+#[test]
+fn without_the_server_s_times_a_gap_without_frames_says_it() {
+    let mut nora = started();
+    poll(&mut nora, 100, json!([]), json!([]));
+    let outputs = poll_queue(&mut nora, 480_000, json!({"actions": [type_text("c1")]}));
+    assert!(documents(&outputs).is_empty() && refused_with(&outputs, "c1").contains("background"));
+    // A short gap is no freeze.
+    let mut fine = started();
+    poll(&mut fine, 100, json!([]), json!([]));
+    let outputs = poll_queue(&mut fine, 30_000, json!({"actions": [type_text("c1")]}));
+    assert_eq!(documents(&outputs).len(), 1);
+}
+
+/// A read that left before the page went quiet and whose answer waited in the page: its actions are as old as the gap,
+/// whatever the server's times said when it answered.
+#[test]
+fn a_read_answered_while_the_page_ran_nothing_is_refused() {
+    let mut nora = started_at(1_000.0);
+    let outputs = nora.handle(Input::Tick { now_ms: 100 });
+    let messages = request_to(&outputs, protocol::GET_MESSAGES).clone();
+    let queue = request_to(&outputs, protocol::GET_ACTIONS).clone();
+    // Eight minutes without a frame; the host ticks before it hands the answers over.
+    nora.handle(Input::Tick { now_ms: 480_100 });
+    nora.handle(ok(&messages, json!({"success": true, "messages": [], "cards": []})));
+    let refused = nora.handle(ok(&queue, json!({"success": true, "actions": [type_text("c1")], "queued_at": [1_000.5], "now": 1_000.6})));
+    assert!(documents(&refused).is_empty() && refused_with(&refused, "c1").contains("background"));
+    // The next read is judged by the server's times again: an action queued now runs... in another turn.
+    let mut other = started_at(1_000.0);
+    poll(&mut other, 100, json!([]), json!([]));
+    let fresh = poll_queue(&mut other, 480_100, json!({"actions": [type_text("c2")], "queued_at": [1_480.0], "now": 1_480.2}));
+    assert_eq!(documents(&fresh).len(), 1, "queued after the page came back, while Nora waits for it");
+}
+
+#[test]
+fn a_stop_or_a_new_conversation_forgets_the_lost_turn() {
+    let lost = || {
+        let mut nora = started_at(1_000.0);
+        poll_queue(&mut nora, 100, json!({"actions": [], "missed": 1_002.0, "now": 1_490.0}));
+        nora
+    };
+    let mut stopped = lost();
+    stopped.handle(Input::Cancel);
+    assert_eq!(stopped.resumable(), None);
+    let mut reset = lost();
+    reset.handle(Input::Reset);
+    assert_eq!(reset.resumable(), None);
+    // A Stop sent by a host while the session reads late, too.
+    let mut late = started_at(1_000.0);
+    given_up(&mut late);
+    poll_queue(&mut late, 495_200, json!({"actions": [], "missed": 1_010.0, "now": 1_495.0}));
+    assert!(late.resumable().is_some());
+    late.handle(Input::Cancel);
+    assert_eq!(late.resumable(), None);
+}
+
+/// A turn given up on and read late: a queue that expired unread there too offers to resume it.
+#[test]
+fn a_turn_read_late_that_lost_an_action_offers_to_resume_it() {
+    let mut nora = started_at(1_000.0);
+    given_up(&mut nora);
+    poll_queue(&mut nora, 495_200, json!({"actions": [], "missed": 1_010.0, "now": 1_495.0}));
+    assert_eq!(nora.resumable(), Some("Bonjour"));
+}

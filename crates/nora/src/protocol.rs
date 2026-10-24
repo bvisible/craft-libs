@@ -279,6 +279,20 @@ pub fn sent_at_of(message: &Value) -> Option<f64> {
     message.get("sent_at").and_then(Value::as_f64)
 }
 
+/// When each action of a read of the queue (`get_browser_actions`) was queued, in the order of its actions, and the
+/// server's time of the read, both by the server's clock (epoch seconds): how long each action waited for the editor.
+/// An older server says neither (`None`s).
+pub fn waits_of(message: &Value) -> (Vec<Option<f64>>, Option<f64>) {
+    let queued = message.get("queued_at").and_then(Value::as_array).map(|list| list.iter().map(Value::as_f64).collect()).unwrap_or_default();
+    (queued, message.get("now").and_then(Value::as_f64))
+}
+
+/// When the oldest action of a queue that expired before the editor read it was queued (the server's clock): the
+/// editor ran nothing then (a tab in the background, a computer asleep). `None` when no queue expired unread.
+pub fn missed_of(message: &Value) -> Option<f64> {
+    message.get("missed").and_then(Value::as_f64)
+}
+
 /// The server time at which the action queue of `get_browser_actions` was last filled.
 pub fn queued_at_of(message: &Value) -> Option<f64> {
     message.get("timestamp").and_then(Value::as_f64)

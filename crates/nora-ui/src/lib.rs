@@ -185,10 +185,27 @@ impl Colors {
     }
 }
 
+/// What the panel says under a turn that lost an action to a page that ran nothing (a tab in the background, a computer
+/// asleep: `NoraSession::resumable`), and its button, which sends the same request again. English by default: an app
+/// sets its own words here (a field of its own, so that an app built on [`NoraLabels`] keeps building).
+#[derive(Debug, Clone)]
+pub struct ResumeWords {
+    pub said: String,
+    pub resume: String,
+}
+
+impl Default for ResumeWords {
+    fn default() -> Self {
+        ResumeWords { said: "This tab was in the background: Nora could not act in the document.".into(), resume: "Resume".into() }
+    }
+}
+
 /// The conversation with Nora, drawn into the `Ui` it is given (a side panel, a window…).
 #[derive(Debug, Default)]
 pub struct NoraPanel {
     pub labels: NoraLabels,
+    /// Under a turn lost to a page that ran nothing: what is said, and the button that sends the request again.
+    pub resume_words: ResumeWords,
     pub style: NoraStyle,
     /// Set when the host has no way to reach Nora: the panel then says why instead of offering a
     /// text box that would swallow the message.
@@ -336,6 +353,14 @@ impl NoraPanel {
                     _ => error.to_string(),
                 };
                 ui.colored_label(colors.error, said);
+            }
+            // A turn lost to a page that ran nothing: the same request again, on the person's click only (a new turn).
+            if let Some(request) = session.resumable() {
+                ui.add_space(ui.spacing().item_spacing.y);
+                ui.add(Label::new(RichText::new(self.resume_words.said.as_str()).color(colors.warn)).wrap());
+                if ui.button(self.resume_words.resume.as_str()).clicked() {
+                    actions.push(PanelAction::Send(request.to_string()));
+                }
             }
         });
         let end = (shown.content_size.y - shown.inner_rect.height()).max(0.0);
@@ -757,6 +782,44 @@ mod tests {
         h.run_steps(60);
         let newest = h.get_by_label("The newest reply").rect();
         assert!(newest.min.y >= 0.0 && newest.max.y <= height, "the reply is in view, not below the edge: {newest:?}");
+    }
+
+    /// A turn whose action waited too long for a page that ran nothing (a tab in the background): the panel says so and
+    /// offers the same request again, sent on the click only; in the app's words when it gives them.
+    #[test]
+    fn a_turn_lost_to_a_tab_in_the_background_offers_to_resume() {
+        let lost = || {
+            let mut nora = session();
+            let sent = nora.handle(Input::Send("Write 42 in B2".into()));
+            answer(&mut nora, &sent[0], json!({ "thread_id": "t1", "sent_at": 1_000.0 }));
+            let polls = nora.handle(Input::Tick { now_ms: 10 });
+            answer(&mut nora, &polls[0], json!({ "messages": [] }));
+            let action = json!({ "action": "doc_type_text", "text": "42", "callback_id": "c1" });
+            answer(&mut nora, &polls[1], json!({ "actions": [action], "queued_at": [1_002.0], "now": 1_500.0 }));
+            let polls = nora.handle(Input::Tick { now_ms: 500 });
+            let reply = json!({ "role": "assistant", "text": "Nothing was changed.", "ts": 1_501.0 });
+            answer(&mut nora, &polls[0], json!({ "messages": [reply] }));
+            answer(&mut nora, &polls[1], json!({ "actions": [] }));
+            nora.handle(Input::Tick { now_ms: 5_000 });
+            assert_eq!(nora.resumable(), Some("Write 42 in B2"));
+            nora
+        };
+        let mut h = harness(lost());
+        h.run();
+        assert!(h.state().actions.is_empty(), "never sent by itself");
+        assert!(h.query_by_label("This tab was in the background: Nora could not act in the document.").is_some());
+        h.get_by_label("Resume").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::Send("Write 42 in B2".into())]);
+        let mut french = harness(lost());
+        french.state_mut().panel.resume_words =
+            ResumeWords { said: "L'onglet était en arrière-plan : Nora n'a pas pu agir dans le document.".into(), resume: "Reprendre".into() };
+        french.run();
+        assert!(french.query_by_label("Reprendre").is_some() && french.query_by_label("Resume").is_none());
+        // Nothing to resume in a turn that went well.
+        let mut fine = harness(conversation());
+        fine.run();
+        assert!(fine.query_by_label("Resume").is_none());
     }
 
     #[test]
