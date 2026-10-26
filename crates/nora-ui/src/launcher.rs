@@ -179,11 +179,13 @@ mod tests {
         words: LauncherWords,
         clicked: usize,
         document: Option<Rect>,
+        window: Option<Rect>,
     }
 
     fn harness() -> Harness<'static, State> {
         Harness::builder().with_size(egui::vec2(480.0, 320.0)).build_ui_state(
             |ui, state: &mut State| {
+                state.window = Some(ui.max_rect());
                 // As an app does: the rail, its button labelled for screen readers.
                 let response = rail(ui, Frame::NONE, &state.words);
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Nora"));
@@ -203,7 +205,8 @@ mod tests {
         h.run();
         let button = h.get_by_label("Nora");
         let at = button.rect();
-        assert!(at.max.x <= 480.0 && at.min.x >= 480.0 - RAIL_WIDTH, "at the right edge, in the rail: {at:?}");
+        let window = h.state().window.expect("the window is drawn");
+        assert!(at.max.x <= window.max.x && at.min.x >= window.max.x - RAIL_WIDTH, "at the right edge, in the rail: {at:?} in {window:?}");
         let document = h.state().document.expect("the document is drawn");
         assert!(document.max.x <= at.min.x, "the document is beside it, not under it: {document:?}, {at:?}");
         h.get_by_label("Nora").click();
@@ -214,11 +217,12 @@ mod tests {
     #[test]
     fn the_orb_is_drawn_in_any_rect_and_never_in_none() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             paint_orb(ui.painter(), Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 18.0)), clay(false));
             paint_orb(ui.painter(), Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0)), clay(true));
             paint_orb(ui.painter(), Rect::NOTHING, clay(true));
         });
+        output.textures_delta.clear();
         assert_ne!(clay(false), clay(true));
         assert_eq!(LauncherWords::default().open, "Open Nora");
     }
