@@ -17,6 +17,10 @@ craft-nora = { workspace = true }
 # written to the API both share (its CI checks it on 0.37 too). Cargo keeps one egui per app: the one its lock has.
 egui = { version = ">=0.36, <0.38", default-features = false }
 
+# //// Neoffice — the pane's state, remembered in the browser (launcher.rs, PaneMemory).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }
 egui_kittest = "0.36"

@@ -31,7 +31,10 @@
 //! Everything the user reads is in [`NoraLabels`] (English by default); an app passes its own
 //! translations. The colors follow the egui theme unless [`NoraStyle`] says otherwise.
 
+pub mod launcher;
 mod markdown;
+
+pub use launcher::{LauncherWords, PaneMemory};
 
 use std::time::Duration;
 

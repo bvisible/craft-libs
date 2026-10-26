@@ -878,6 +878,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "serde_json",
+ "web-sys",
 ]
 
 [[package]]
