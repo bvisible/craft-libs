@@ -178,7 +178,7 @@ mod tests {
     struct State {
         words: LauncherWords,
         clicked: usize,
-        document: Rect,
+        document: Option<Rect>,
     }
 
     fn harness() -> Harness<'static, State> {
@@ -190,7 +190,7 @@ mod tests {
                 if response.clicked() {
                     state.clicked += 1;
                 }
-                state.document = egui::CentralPanel::default().show(ui, |ui| ui.max_rect()).inner;
+                state.document = Some(egui::CentralPanel::default().show(ui, |ui| ui.max_rect()).inner);
             },
             State::default(),
         )
@@ -204,7 +204,7 @@ mod tests {
         let button = h.get_by_label("Nora");
         let at = button.rect();
         assert!(at.max.x <= 480.0 && at.min.x >= 480.0 - RAIL_WIDTH, "at the right edge, in the rail: {at:?}");
-        let document = h.state().document;
+        let document = h.state().document.expect("the document is drawn");
         assert!(document.max.x <= at.min.x, "the document is beside it, not under it: {document:?}, {at:?}");
         h.get_by_label("Nora").click();
         h.run();
