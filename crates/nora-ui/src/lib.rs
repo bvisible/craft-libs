@@ -188,6 +188,22 @@ impl Colors {
     }
 }
 
+/// How strong the panel's weak words are (the greeting, the text box's hint, the notes under a turn), and its buttons that
+/// cannot be used yet (« Undo », « New conversation », « Send » with nothing typed): egui's 60 % and 50 % of the text's
+/// colour fell under 4.5:1 on a dark pane.
+const WEAK_TEXT: f32 = 0.75;
+const DISABLED_ALPHA: f32 = 0.7;
+
+/// The panel's words in the app's text colour (`NoraStyle::nora_text`), its weak words and its buttons that cannot be used
+/// yet at [`WEAK_TEXT`] and [`DISABLED_ALPHA`] of it. An app that leaves egui's text colours to egui for a theme (its own
+/// set for the other, the page then following the system into dark) had the whole panel in egui's grey: some 2:1 on its
+/// dark pane.
+fn legible(visuals: &mut Visuals, text: Color32) {
+    visuals.override_text_color = Some(text);
+    visuals.weak_text_color = Some(text.gamma_multiply(WEAK_TEXT));
+    visuals.disabled_alpha = visuals.disabled_alpha.max(DISABLED_ALPHA);
+}
+
 /// What the panel says under a turn that lost an action to a page that ran nothing (a tab in the background, a computer
 /// asleep: `NoraSession::resumable`), and its button, which sends the same request again. English by default: an app
 /// sets its own words here (a field of its own, so that an app built on [`NoraLabels`] keeps building).
@@ -296,6 +312,9 @@ impl NoraPanel {
     pub fn show(&mut self, ui: &mut Ui, session: &NoraSession) -> Vec<PanelAction> {
         let mut actions = Vec::new();
         let colors = Colors::resolve(&self.style, ui.visuals());
+        // The panel's words readable whatever egui's text colours are ([`legible`]); the app's own as they were after.
+        let kept = ui.visuals().clone();
+        legible(ui.visuals_mut(), colors.nora_text);
         // (`make_persistent_id`: the same id as `ui.id().with(…)` on egui 0.36, and not deprecated on 0.37.)
         let id = ui.make_persistent_id("nora");
         self.header(ui, session, &mut actions);
@@ -306,6 +325,7 @@ impl NoraPanel {
             .frame(Frame::new().inner_margin(Margin::symmetric(0, 6)))
             .show(ui, |ui| self.input_row(ui, id.with("input"), session.is_busy(), &mut actions));
         CentralPanel::no_frame().show(ui, |ui| self.transcript(ui, session, &colors, &mut actions));
+        *ui.visuals_mut() = kept;
         actions
     }
 
@@ -698,6 +718,57 @@ mod tests {
         h.run_steps(3);
         h.get_by_role(egui::accesskit::Role::MultilineTextInput).type_text(text);
         h.run_steps(3);
+    }
+
+    /// `color`, translucent (premultiplied, as egui keeps it), drawn over `under`.
+    fn over(color: Color32, under: Color32) -> Color32 {
+        let mix = |c: u8, u: u8| (c as f32 + u as f32 * (1.0 - color.a() as f32 / 255.0)).round().min(255.0) as u8;
+        Color32::from_rgb(mix(color.r(), under.r()), mix(color.g(), under.g()), mix(color.b(), under.b()))
+    }
+
+    /// The WCAG contrast of two colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let luminance = |c: Color32| {
+            let channel = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        };
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// On a dark pane whose app left egui's text colours to egui (egui's grey text), and on the light and dark panes of the
+    /// editors, the panel's words are in the app's colour and its weak words and its buttons that cannot be used yet stay
+    /// above 4.5:1; the app's own visuals are as they were once the panel is drawn.
+    #[test]
+    fn the_panel_s_words_stay_readable_on_light_and_dark_panes() {
+        let panes = [
+            (Visuals::dark(), Color32::from_rgb(0x2D, 0x2D, 0x2D), Color32::from_rgb(0xEE, 0xEE, 0xEE)),
+            (Visuals::dark(), Color32::from_rgb(0x22, 0x22, 0x22), Color32::from_rgb(0xEB, 0xEB, 0xEB)),
+            (Visuals::light(), Color32::WHITE, Color32::from_rgb(0x24, 0x24, 0x24)),
+        ];
+        for (mut visuals, pane, text) in panes {
+            assert!(contrast(over(visuals.weak_text_color(), pane), pane) < 4.5 || !visuals.dark_mode, "egui's own weak text");
+            legible(&mut visuals, text);
+            assert_eq!(visuals.text_color(), text);
+            let weak = contrast(over(visuals.weak_text_color(), pane), pane);
+            let disabled = contrast(over(visuals.disable(text), pane), pane);
+            assert!(weak >= 4.5 && disabled >= 4.5, "{pane:?}: weak {weak:.2}, a button not usable yet {disabled:.2}");
+            assert!(disabled < contrast(text, pane), "a button not usable yet still reads as such");
+        }
+        // The app's visuals are left as they were.
+        let mut h = Harness::builder().with_size(egui::vec2(360.0, 520.0)).build_ui_state(
+            |ui, state: &mut (NoraPanel, NoraSession, Option<(Option<Color32>, f32)>)| {
+                ui.visuals_mut().override_text_color = None;
+                state.0.show(ui, &state.1);
+                state.2 = Some((ui.visuals().override_text_color, ui.visuals().disabled_alpha));
+            },
+            (NoraPanel::new(), session(), None),
+        );
+        h.run();
+        assert_eq!(h.state().2, Some((None, Visuals::light().disabled_alpha)));
     }
 
     fn harness(session: NoraSession) -> Harness<'static, State> {
