@@ -95,8 +95,9 @@ impl Default for LauncherWords {
     }
 }
 
-/// The width of the pill with its words, in points.
-fn full_width(ui: &Ui, words: &LauncherWords) -> f32 {
+/// The width of the pill with its words, in points: an app that places the button in a space of its own measures with
+/// it whether the words fit there ([`button_sized`]).
+pub fn full_width(ui: &Ui, words: &LauncherWords) -> f32 {
     let label = ui.painter().layout_no_wrap(words.label.clone(), FontId::proportional(12.0), Color32::PLACEHOLDER);
     10.0 + (PILL_HEIGHT - 10.0) + 6.0 + label.size().x + 10.0
 }
@@ -106,8 +107,15 @@ fn full_width(ui: &Ui, words: &LauncherWords) -> f32 {
 /// while her pane is `open`. True in `.clicked()` when the person asks to open or close the pane. The app labels it for
 /// screen readers (see the module).
 pub fn button(ui: &mut Ui, words: &LauncherWords, open: bool) -> Response {
+    let compact = ui.available_width() < full_width(ui, words) * 3.0;
+    button_sized(ui, words, open, compact)
+}
+
+/// Nora's button with its words, or her sphere alone when `compact` (its words then in the bubble), for an app that
+/// knows the room its bar leaves better than the row the button is placed in can say: a group of icons of a fixed
+/// width, beside a centred title. Otherwise as [`button`].
+pub fn button_sized(ui: &mut Ui, words: &LauncherWords, open: bool, compact: bool) -> Response {
     let full = full_width(ui, words);
-    let compact = ui.available_width() < full * 3.0;
     let dark = ui.visuals().dark_mode;
     let tone = tone(dark);
     let width = if compact { PILL_HEIGHT } else { full };
@@ -250,6 +258,28 @@ mod tests {
         narrow.run();
         let short = narrow.state().rect.expect("drawn");
         assert_eq!(short.width(), PILL_HEIGHT, "the sphere alone: {short:?}");
+    }
+
+    /// An app that measures its own room says whether the words fit: the pill with its words in a short row, her sphere
+    /// alone in a long one, as asked.
+    #[test]
+    fn an_app_that_measures_its_room_chooses_the_words_or_the_sphere() {
+        for (width, compact) in [(120.0, false), (900.0, true)] {
+            let mut h = Harness::builder().with_size(egui::vec2(width, 60.0)).build_ui_state(
+                move |ui, state: &mut State| {
+                    let response = button_sized(ui, &state.words, state.open, compact);
+                    state.rect = Some(response.rect);
+                },
+                State { words: LauncherWords::default(), open: false, rect: None },
+            );
+            h.run();
+            let drawn = h.state().rect.expect("drawn");
+            if compact {
+                assert_eq!(drawn.width(), PILL_HEIGHT, "the sphere alone, as asked: {drawn:?}");
+            } else {
+                assert!(drawn.width() > PILL_HEIGHT * 2.0, "the words, as asked, even in a short row: {drawn:?}");
+            }
+        }
     }
 
     #[test]
