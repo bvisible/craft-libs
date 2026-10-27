@@ -1,32 +1,54 @@
-// //// Neoffice — added file (no upstream equivalent): what brings Nora's pane back once it is closed.
+// //// Neoffice — added file (no upstream equivalent): Nora's button in an editor's top bar, which opens and closes her pane.
 
-//! Nora's pane is open by default; once the person closes it with its cross, a narrow rail stays at the right edge of
-//! the window, beside the document and never over it, with Nora's sphere on it: the mark NeoMail shows her by, in the
-//! clay of Neoffice. A click opens the pane again, on the same conversation (the session is the app's, untouched). Its
-//! words, in the app's language, show in a bubble on hover ([`LauncherWords`]).
+//! Nora's button, in the bar at the top of an editor's window, whatever tab of the ribbon is in view: the « Ask Nora »
+//! pill NeoMail shows, her sphere and its words in the clay of Neoffice, or her sphere alone, its words in a bubble,
+//! when the bar is short of room. A click opens her pane, or closes it, on the same conversation (the session is the
+//! app's, untouched); the pill is lit while the pane is open. Closed, the pane leaves the whole width to the document.
 //!
 //! Whether the pane is open is remembered per editor in the browser ([`PaneMemory`]), and open when nothing is: a
 //! browser that refuses its storage (a private window, cookies off) opens it, as before.
 //!
-//! The app labels the button for screen readers itself: egui 0.36 and 0.37 name a widget's role differently
-//! (`WidgetType`, then accesskit's `Role`), and this crate builds on both.
+//! The app places the button and labels it for screen readers itself: egui 0.36 and 0.37 name a widget's role
+//! differently (`WidgetType`, then accesskit's `Role`), and this crate builds on both.
 
-use egui::{Color32, Frame, Painter, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Color32, FontId, Painter, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
-/// The width of the rail at the right edge of the window, in points: the sphere's button and its margins.
-pub const RAIL_WIDTH: f32 = 40.0;
+/// The height of the pill, in points: NeoMail's.
+pub const PILL_HEIGHT: f32 = 24.0;
 
-/// The side of the button, in points.
-const BUTTON: f32 = 30.0;
+/// Nora's colours in a light or dark theme, as NeoMail draws her (its `nora::look::tone`).
+#[derive(Debug, Clone, Copy)]
+struct Tone {
+    orb: Color32,
+    text: Color32,
+    fill: Color32,
+    hover: Color32,
+    border: Color32,
+}
+
+fn tone(dark: bool) -> Tone {
+    if dark {
+        Tone {
+            orb: Color32::from_rgb(0xD6, 0x8A, 0x59),
+            text: Color32::from_rgb(0xE7, 0xB4, 0x8F),
+            fill: Color32::from_rgb(0x3A, 0x2A, 0x21),
+            hover: Color32::from_rgb(0x46, 0x33, 0x2A),
+            border: Color32::from_rgb(0x7A, 0x4A, 0x2C),
+        }
+    } else {
+        Tone {
+            orb: Color32::from_rgb(0xA1, 0x5A, 0x2E),
+            text: Color32::from_rgb(0x8A, 0x4A, 0x22),
+            fill: Color32::from_rgb(0xF7, 0xEB, 0xE3),
+            hover: Color32::from_rgb(0xF0, 0xDC, 0xCE),
+            border: Color32::from_rgb(0xE2, 0xB5, 0x97),
+        }
+    }
+}
 
 /// Nora's colour: the clay of Neoffice, darker on a light theme and lighter on a dark one, as NeoMail draws her.
 pub fn clay(dark: bool) -> Color32 {
-    if dark { Color32::from_rgb(0xD6, 0x8A, 0x59) } else { Color32::from_rgb(0xA1, 0x5A, 0x2E) }
-}
-
-/// What the button is filled with under the pointer.
-fn hover_fill(dark: bool) -> Color32 {
-    if dark { Color32::from_rgb(0x46, 0x33, 0x2A) } else { Color32::from_rgb(0xF0, 0xDC, 0xCE) }
+    tone(dark).orb
 }
 
 /// Nora's sphere in `rect`, the Nora app's orb as NeoMail draws it: seven rings of latitude, the near half of each
@@ -59,42 +81,53 @@ pub fn paint_orb(painter: &Painter, rect: Rect, color: Color32) {
     }
 }
 
-/// What the button says in its bubble, in the app's language. English by default: an app sets its own words here.
+/// What the button says, in the app's language: its words, and what its bubble says of Nora. English by default, as
+/// NeoMail says them: an app sets its own words here.
 #[derive(Debug, Clone)]
 pub struct LauncherWords {
-    pub open: String,
+    pub label: String,
+    pub tip: String,
 }
 
 impl Default for LauncherWords {
     fn default() -> Self {
-        LauncherWords { open: "Open Nora".into() }
+        LauncherWords { label: "Ask Nora".into(), tip: "Nora, the Neoffice assistant".into() }
     }
 }
 
-/// Nora's button: her sphere, lit under the pointer or with the keyboard's focus, its words in a bubble on hover. True
-/// in `.clicked()` when the person asks for the pane. The app labels it for screen readers (see the module).
-pub fn button(ui: &mut Ui, words: &LauncherWords) -> Response {
+/// The width of the pill with its words, in points.
+fn full_width(ui: &Ui, words: &LauncherWords) -> f32 {
+    let label = ui.painter().layout_no_wrap(words.label.clone(), FontId::proportional(12.0), Color32::PLACEHOLDER);
+    10.0 + (PILL_HEIGHT - 10.0) + 6.0 + label.size().x + 10.0
+}
+
+/// Nora's button, where the app places it (the right of its top bar): the pill with her sphere and its words, or her
+/// sphere alone when the space left in the row is short (less than three pills), its words then in the bubble. Lit
+/// while her pane is `open`. True in `.clicked()` when the person asks to open or close the pane. The app labels it for
+/// screen readers (see the module).
+pub fn button(ui: &mut Ui, words: &LauncherWords, open: bool) -> Response {
+    let full = full_width(ui, words);
+    let compact = ui.available_width() < full * 3.0;
     let dark = ui.visuals().dark_mode;
-    let (rect, response) = ui.allocate_exact_size(vec2(BUTTON, BUTTON), Sense::click());
+    let tone = tone(dark);
+    let width = if compact { PILL_HEIGHT } else { full };
+    let (rect, response) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::click());
     if ui.is_rect_visible(rect) {
-        if response.hovered() || response.has_focus() || response.is_pointer_button_down_on() {
-            ui.painter().rect_filled(rect, 7.0, hover_fill(dark));
+        let lit = open || response.hovered() || response.has_focus() || response.is_pointer_button_down_on();
+        let border = if open { Stroke::new(1.5, tone.orb) } else { Stroke::new(1.0, tone.border) };
+        let painter = ui.painter();
+        painter.rect(rect, PILL_HEIGHT / 2.0, if lit { tone.hover } else { tone.fill }, border, StrokeKind::Inside);
+        let side = PILL_HEIGHT - 10.0;
+        let at = if compact { rect.center().x - side / 2.0 } else { rect.min.x + 10.0 };
+        let mark = Rect::from_min_size(pos2(at, rect.min.y + 5.0), vec2(side, side));
+        paint_orb(painter, mark, tone.orb);
+        if !compact {
+            let label = painter.layout_no_wrap(words.label.clone(), FontId::proportional(12.0), tone.text);
+            let at = pos2(mark.max.x + 6.0, rect.center().y - label.size().y / 2.0);
+            painter.galley(at, label, tone.text);
         }
-        paint_orb(ui.painter(), rect.shrink(6.0), clay(dark));
     }
-    response.on_hover_text(words.open.as_str())
-}
-
-/// The rail at the right edge of the window, outermost, with Nora's button at its top: drawn where the pane would be,
-/// while it is closed. `frame` is the app's frame for its panes (its fill and border). The button's response: the app
-/// opens the pane on its click.
-pub fn rail(ui: &mut Ui, frame: Frame, words: &LauncherWords) -> Response {
-    egui::Panel::right("nora_rail")
-        .resizable(false)
-        .exact_size(RAIL_WIDTH)
-        .frame(frame)
-        .show(ui, |ui| ui.vertical_centered(|ui| button(ui, words)).inner)
-        .inner
+    response.on_hover_text(if compact { words.label.as_str() } else { words.tip.as_str() })
 }
 
 /// Whether Nora's pane is open, remembered per editor in the browser's `localStorage`. Open when nothing is
@@ -174,44 +207,49 @@ mod tests {
         assert!(memory.open());
     }
 
-    #[derive(Default)]
     struct State {
         words: LauncherWords,
-        clicked: usize,
-        document: Option<Rect>,
-        window: Option<Rect>,
+        open: bool,
+        rect: Option<Rect>,
     }
 
-    fn harness() -> Harness<'static, State> {
-        Harness::builder().with_size(egui::vec2(480.0, 320.0)).build_ui_state(
+    /// A top bar `width` points wide, as an app has it: the button at its right, labelled for screen readers, and a
+    /// click that opens or closes the pane.
+    fn bar(width: f32) -> Harness<'static, State> {
+        Harness::builder().with_size(egui::vec2(width, 60.0)).build_ui_state(
             |ui, state: &mut State| {
-                state.window = Some(ui.max_rect());
-                // As an app does: the rail, its button labelled for screen readers.
-                let response = rail(ui, Frame::NONE, &state.words);
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Nora"));
-                if response.clicked() {
-                    state.clicked += 1;
-                }
-                state.document = Some(egui::CentralPanel::default().show(ui, |ui| ui.max_rect()).inner);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let response = button(ui, &state.words, state.open);
+                    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, state.open, &state.words.label));
+                    state.rect = Some(response.rect);
+                    if response.clicked() {
+                        state.open = !state.open;
+                    }
+                });
             },
-            State::default(),
+            State { words: LauncherWords::default(), open: true, rect: None },
         )
     }
 
-    /// The pane closed, the rail stays at the right edge beside the document, and its button asks for the pane.
+    /// The button opens and closes the pane: the pill with its words where the bar has room, the sphere alone where it
+    /// hasn't.
     #[test]
-    fn the_rail_stays_at_the_right_edge_and_asks_for_the_pane() {
-        let mut h = harness();
+    fn the_button_opens_and_closes_the_pane() {
+        let mut h = bar(900.0);
         h.run();
-        let button = h.get_by_label("Nora");
-        let at = button.rect();
-        let window = h.state().window.expect("the window is drawn");
-        assert!(at.max.x <= window.max.x && at.min.x >= window.max.x - RAIL_WIDTH, "at the right edge, in the rail: {at:?} in {window:?}");
-        let document = h.state().document.expect("the document is drawn");
-        assert!(document.max.x <= at.min.x, "the document is beside it, not under it: {document:?}, {at:?}");
-        h.get_by_label("Nora").click();
+        let wide = h.state().rect.expect("drawn");
+        assert!(wide.width() > PILL_HEIGHT * 2.0, "the pill with its words: {wide:?}");
+        assert_eq!(wide.height(), PILL_HEIGHT);
+        h.get_by_label("Ask Nora").click();
         h.run();
-        assert_eq!(h.state().clicked, 1);
+        assert!(!h.state().open, "closed");
+        h.get_by_label("Ask Nora").click();
+        h.run();
+        assert!(h.state().open, "open again");
+        let mut narrow = bar(120.0);
+        narrow.run();
+        let short = narrow.state().rect.expect("drawn");
+        assert_eq!(short.width(), PILL_HEIGHT, "the sphere alone: {short:?}");
     }
 
     #[test]
@@ -224,6 +262,7 @@ mod tests {
         });
         output.textures_delta.clear();
         assert_ne!(clay(false), clay(true));
-        assert_eq!(LauncherWords::default().open, "Open Nora");
+        assert_eq!(LauncherWords::default().label, "Ask Nora");
+        assert_eq!(LauncherWords::default().tip, "Nora, the Neoffice assistant");
     }
 }
