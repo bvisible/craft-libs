@@ -33,8 +33,11 @@
 
 pub mod launcher;
 mod markdown;
+pub mod proposal;
 
 pub use launcher::{LauncherWords, PaneMemory};
+pub use proposal::Context as ProposalContext;
+pub use proposal::{Choice, ConsentWords, ProposalAction, ProposalCard, ProposalTone, ProposalWords};
 
 use std::time::Duration;
 

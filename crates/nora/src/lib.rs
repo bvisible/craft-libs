@@ -26,6 +26,9 @@
 //! `get_browser_actions`) and `nora.api.page_observation.receive_observation`. An editor is one
 //! canvas, so Nora asks for it through its own family of actions, `doc_*` ([`DocActionKind`]).
 //!
+//! A [`Proposal`] is what Nora prepared for the person to send (NeoMail's ready replies): replies with fields to fill
+//! where she could not know, each empty field a visible marker until it is filled ([`proposal`]).
+//!
 //! With the `ai-core` feature, the errors and the turns also speak the vocabulary of
 //! `craft-ai-core` (`NoraError::kind`, `NoraSession::turn_state`), so that a host shows Nora with its
 //! other AI connections.
@@ -35,6 +38,7 @@ pub mod error;
 pub mod http;
 pub mod links;
 pub mod policy;
+pub mod proposal;
 pub mod protocol;
 pub mod reply;
 pub mod session;
@@ -43,6 +47,7 @@ pub use context::{AppKind, DocumentInfo, PageContext, Selection};
 pub use error::NoraError;
 pub use http::{HttpRequest, HttpResponse, RequestId};
 pub use policy::{CommandPolicy, Decision};
+pub use proposal::{Field, FieldKind, Piece, Proposal, Ready, Reply, StyleState, parse_ready};
 pub use protocol::{Card, CardChoice, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
 pub use reply::{Segment, instance_path, segments};
 pub use session::{Confirmation, Correction, DocumentCall, Input, NoraSession, Output, SessionConfig, ShownCard};
