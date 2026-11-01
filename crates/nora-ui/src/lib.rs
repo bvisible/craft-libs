@@ -85,6 +85,10 @@ impl PanelAction {
     }
 }
 
+/// What an app draws in the panel while the conversation is empty ([`NoraPanel::show_with`]): it gets the `Ui` and the
+/// hint's words, and answers the request the person picked, if any.
+pub type EmptyState<'a> = &'a mut dyn FnMut(&mut Ui, &str) -> Option<String>;
+
 /// The words of the panel. English by default; an app fills in its own language.
 #[derive(Debug, Clone)]
 pub struct NoraLabels {
@@ -313,6 +317,14 @@ impl NoraPanel {
 
     /// Draws the panel and returns what the user did this frame.
     pub fn show(&mut self, ui: &mut Ui, session: &NoraSession) -> Vec<PanelAction> {
+        self.show_with(ui, session, None)
+    }
+
+    /// Draws the panel like [`show`](Self::show), with what the app draws while the conversation is empty: `empty` is
+    /// given the `Ui` of the conversation's area, under the header and its buttons where the hint goes, and the hint's
+    /// words ([`NoraLabels::empty`]) to place where it wants. A request it returns is sent as if the person had typed
+    /// it (`PanelAction::Send`). Once there is a message to read, or Nora works, it is not drawn.
+    pub fn show_with(&mut self, ui: &mut Ui, session: &NoraSession, empty: Option<EmptyState<'_>>) -> Vec<PanelAction> {
         let mut actions = Vec::new();
         let colors = Colors::resolve(&self.style, ui.visuals());
         // The panel's words readable whatever egui's text colours are ([`legible`]); the app's own as they were after.
@@ -327,7 +339,7 @@ impl NoraPanel {
         Panel::bottom(id.with("input-panel"))
             .frame(Frame::new().inner_margin(Margin::symmetric(0, 6)))
             .show(ui, |ui| self.input_row(ui, id.with("input"), session.is_busy(), &mut actions));
-        CentralPanel::no_frame().show(ui, |ui| self.transcript(ui, session, &colors, &mut actions));
+        CentralPanel::no_frame().show(ui, |ui| self.transcript(ui, session, &colors, &mut actions, empty));
         *ui.visuals_mut() = kept;
         actions
     }
@@ -350,7 +362,7 @@ impl NoraPanel {
         });
     }
 
-    fn transcript(&mut self, ui: &mut Ui, session: &NoraSession, colors: &Colors, actions: &mut Vec<PanelAction>) {
+    fn transcript(&mut self, ui: &mut Ui, session: &NoraSession, colors: &Colors, actions: &mut Vec<PanelAction>, empty: Option<EmptyState<'_>>) {
         let mut area = ScrollArea::vertical().id_salt("nora-transcript").auto_shrink([false, false]).stick_to_bottom(true);
         // The user just sent something: show it, even when they had scrolled up. The view is put exactly at the end as
         // it was last drawn, where egui counts it as stuck to the end, so that `stick_to_bottom` follows what comes
@@ -366,7 +378,16 @@ impl NoraPanel {
             at = viewport.min.y;
             if session.transcript().is_empty() && !session.is_busy() {
                 ui.add_space(ui.spacing().item_spacing.y * 4.0);
-                ui.vertical_centered(|ui| ui.weak(self.labels.empty.as_str()));
+                match empty {
+                    Some(draw) => {
+                        if let Some(request) = draw(ui, self.labels.empty.as_str()) {
+                            actions.push(PanelAction::Send(request));
+                        }
+                    }
+                    None => {
+                        ui.vertical_centered(|ui| ui.weak(self.labels.empty.as_str()));
+                    }
+                }
             }
             // The cards of the conversation, each under the message it came after; those of the turn that runs, at the end.
             let cards = session.cards();
@@ -782,6 +803,67 @@ mod tests {
             },
             State { panel: NoraPanel::new(), session, actions: Vec::new() },
         )
+    }
+
+    /// A panel whose app draws a request of its own while the conversation is empty (`NoraPanel::show_with`).
+    struct Slot {
+        panel: NoraPanel,
+        session: NoraSession,
+        actions: Vec<PanelAction>,
+        hint: Option<String>,
+    }
+
+    fn slot_harness(session: NoraSession) -> Harness<'static, Slot> {
+        Harness::builder().with_size(egui::vec2(360.0, 520.0)).build_ui_state(
+            |ui, state: &mut Slot| {
+                let mut hint = None;
+                let actions = {
+                    let mut draw = |ui: &mut Ui, words: &str| {
+                        hint = Some(words.to_string());
+                        ui.button("A ready-made request").clicked().then(|| "Do the ready thing".to_string())
+                    };
+                    state.panel.show_with(ui, &state.session, Some(&mut draw))
+                };
+                state.hint = state.hint.take().or(hint);
+                state.actions.extend(actions);
+            },
+            Slot { panel: NoraPanel::new(), session, actions: Vec::new(), hint: None },
+        )
+    }
+
+    #[test]
+    fn what_the_app_draws_while_the_conversation_is_empty_sits_under_the_header_and_replaces_the_hint() {
+        let mut h = slot_harness(session());
+        h.run();
+        let header = h.get_by_label("New conversation").rect();
+        let slot = h.get_by_label("A ready-made request").rect();
+        assert!(slot.top() >= header.bottom(), "under the header's buttons: {header:?} then {slot:?}");
+        // The app is given the hint's words, and the panel does not draw them itself.
+        let hint = NoraLabels::default().empty;
+        assert_eq!(h.state().hint.as_deref(), Some(hint.as_str()));
+        assert!(h.query_by_label(&hint).is_none());
+        assert!(h.query_by_label("Ask Nora…").is_some() || h.query_by_role(egui::accesskit::Role::MultilineTextInput).is_some());
+    }
+
+    #[test]
+    fn a_request_the_app_returns_is_sent_as_if_typed() {
+        let mut h = slot_harness(session());
+        h.run();
+        h.get_by_label("A ready-made request").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::Send("Do the ready thing".into())]);
+    }
+
+    #[test]
+    fn what_the_app_draws_is_gone_once_the_conversation_has_begun() {
+        let mut h = slot_harness(conversation());
+        h.run();
+        assert!(h.query_by_label("A ready-made request").is_none());
+        assert_eq!(h.state().hint, None);
+        // And without an app slot the panel keeps drawing its own hint.
+        let mut plain = harness(session());
+        plain.run();
+        assert!(plain.query_by_label(&NoraLabels::default().empty).is_some());
     }
 
     #[test]
