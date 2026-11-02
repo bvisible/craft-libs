@@ -5,8 +5,9 @@
 # the browser too). `cargo clippy --workspace` is deliberately not used: it fails on upstream code
 # that this fork does not touch. Each check also runs with the crates' features on (craft-nora's
 # `ai-core` speaks upstream's craft-ai-core), so a change of that crate shows here. The panel is
-# also built against egui 0.37, the one NeoMail (UCS's MailCraft) is on, while the editors and this
-# workspace are on 0.36: a change that only builds on one of them shows here, not at NeoMail's pin.
+# also built against egui 0.37 as crates.io has it, in an app of its own and without upstream's patch of the
+# storytold fork that this workspace (since the merge of 2026-11-02) builds on, as NeoMail (UCS's MailCraft) does:
+# a change that only builds on the fork shows here, not at NeoMail's pin.
 name: Neoffice Nora crates
 
 on:

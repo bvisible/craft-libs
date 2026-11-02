@@ -13,8 +13,8 @@ workspace = true
 
 [dependencies]
 craft-nora = { workspace = true }
-# The editors are on egui 0.36 and NeoMail (UCS's MailCraft) on 0.37: the panel takes the one the app has, and is
-# written to the API both share (its CI checks it on 0.37 too). Cargo keeps one egui per app: the one its lock has.
+# The editors and NeoMail (UCS's MailCraft) are on egui 0.37, like this workspace; the range still admits 0.36 for an app
+# that has not moved yet, and the panel is written to the API both share. Cargo keeps one egui per app: the one its lock has.
 egui = { version = ">=0.36, <0.38", default-features = false }
 
 # //// Neoffice — the pane's state, remembered in the browser (launcher.rs, PaneMemory).
@@ -23,5 +23,6 @@ web-sys = { version = "0.3", features = ["Window", "Storage"] }
 
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }
-egui_kittest = "0.36"
+# //// Neoffice — egui_kittest follows the workspace egui (0.37 since the merge of upstream 2026-11-02); the 0.36 one pulls a second egui into the tests.
+egui_kittest = "0.37"
 serde_json = "1"

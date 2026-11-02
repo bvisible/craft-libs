@@ -228,7 +228,7 @@ mod tests {
             |ui, state: &mut State| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = button(ui, &state.words, state.open);
-                    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, state.open, &state.words.label));
+                    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, state.open, &state.words.label));
                     state.rect = Some(response.rect);
                     if response.clicked() {
                         state.open = !state.open;

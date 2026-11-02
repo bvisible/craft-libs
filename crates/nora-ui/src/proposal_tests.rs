@@ -26,7 +26,9 @@ fn proposal() -> Proposal {
 }
 
 fn harness(step: f32) -> Harness<'static, State> {
-    Harness::builder().with_size(egui::vec2(720.0, 620.0)).with_step_dt(step).build_ui_state(
+    // egui 0.37's harness panics on a character no installed font draws, and the check mark of a chosen reply is not in
+    // egui's own fonts (the app's fonts decide how it is drawn); the card is under test here, not the app's font set.
+    Harness::builder().allow_missing_glyphs().with_size(egui::vec2(720.0, 620.0)).with_step_dt(step).build_ui_state(
         |ui, state: &mut State| {
             let words = ProposalWords::default();
             let tone = ProposalTone::from_visuals(ui.visuals());

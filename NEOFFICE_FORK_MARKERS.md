@@ -8,6 +8,15 @@ in TOML and YAML, `<!-- //// Neoffice — … -->` in Markdown. This file holds 
 At the next upstream merge, `grep -rn "////"` in the source plus this file give the complete
 picture of what is ours and why.
 
+## Base of the divergence
+
+Last upstream merge: `storytold/craft-libs` `main` at `ea1fbeb` (2026-11-02, 410 commits after the previous base
+`7895f5e` of 2026-10-24). `git merge-base HEAD upstream/main` gives the base the marker check (CI "Neoffice fork
+markers") compares against. That merge changed none of upstream's code. It moved the workspace to egui 0.37 (on
+upstream's own `[patch]` of the storytold egui fork), so our two crates changed in three places only: the `egui_kittest`
+dev-dependency of `craft-nora-ui` (`0.36` to `0.37`), a renamed accessibility role in one of its tests
+(`WidgetType::Button` to `Role::Button`), and the comments that said the workspace was on 0.36.
+
 ## What the fork adds
 
 Two crates, shared by every Neoffice editor (decision of 2026-10-13): `craft-nora`, the client core
