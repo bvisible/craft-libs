@@ -1683,3 +1683,16 @@ fn reads_come_often_again_right_after_something_happened_late_in_a_turn() {
     assert!(next - now <= 1_000, "right after an action the next read is soon: {} after the action, {slow} in silence", next - now);
     assert!(slow >= 2_000, "silence is read slowly: {slow}");
 }
+
+/// A recording is turned into words in the language the editor speaks, two letters, as the server's engine takes it.
+#[test]
+fn a_dictation_is_asked_in_the_language_of_the_editor() {
+    let mut nora = session();
+    nora.set_language("DE");
+    nora.set_language("zh-hant");
+    nora.set_language("");
+    let sent = nora.handle(Input::Transcribe { audio_base64: "AAAA".into(), mime: "audio/webm".into() });
+    let call = request_to(&sent, protocol::STT_TRANSCRIBE);
+    assert_eq!(call.body["language"], "de", "only a two-letter code is taken, the rest leaves the last one");
+    assert_eq!(call.body["mime"], "audio/webm");
+}

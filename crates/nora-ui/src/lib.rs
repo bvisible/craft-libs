@@ -119,6 +119,7 @@ pub struct NoraLabels {
     pub send: String,
     /// In place of Send while Nora works.
     pub stop: String,
+    /// Nora is working, in one line. The pane now says what she is doing ([`ActivityWords`]); kept for apps that set it.
     pub working: String,
     /// Under the conversation once the user stopped Nora, until the next message.
     pub stopped: String,
@@ -669,8 +670,6 @@ impl NoraPanel {
             Activity::Writing => &self.activity_words.writing,
             Activity::Handing => &self.activity_words.handing,
         };
-        // The panel's own line keeps the label of the host when it set one (« Nora is working… »).
-        let words = if self.labels.working == NoraLabels::default().working { words.as_str() } else { self.labels.working.as_str() };
         let seconds = self.busy_since.map_or(0, |since| (now - since).max(0.0) as u64);
         Frame::new()
             .fill(pal.signal_soft)

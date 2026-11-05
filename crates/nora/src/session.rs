@@ -496,6 +496,15 @@ impl NoraSession {
         self.running.values().map(|run| run.activity).max().unwrap_or_default()
     }
 
+    /// The language the person speaks when they dictate, two letters (`fr`, `en`…): the server's speech engine has no
+    /// automatic detection. The editor says it from its interface language, whenever that changes.
+    pub fn set_language(&mut self, language: &str) {
+        let language = language.trim().to_lowercase();
+        if language.len() == 2 && language.chars().all(|c| c.is_ascii_lowercase()) {
+            self.cfg.language = language;
+        }
+    }
+
     /// The last dictation: the words the server wrote down for a recording, or why it could not. It is for the pane to put
     /// in its box ([`Dictation::id`] tells whether it has).
     pub fn dictation(&self) -> Option<&Dictation> {
