@@ -274,6 +274,10 @@ impl Skin {
     }
 }
 
+/// How often the sphere and the voice's bars are drawn again while Nora works or listens (about twelve a second): an editor
+/// draws its whole window at each frame, and a document window is no place for thirty a second.
+const ANIMATION_FRAME: Duration = Duration::from_millis(80);
+
 /// How strong the panel's weak words are (the greeting, the text box's hint, the notes under a turn), and its buttons that
 /// cannot be used yet (« Undo », « New conversation », « Send » with nothing typed): egui's 60 % and 50 % of the text's
 /// colour fell under 4.5:1 on a dark pane.
@@ -689,8 +693,8 @@ impl NoraPanel {
                     }
                 });
             });
-        // The sphere turns: the frames keep coming, about thirty a second.
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        // The sphere turns: the frames keep coming, about twelve a second.
+        ui.ctx().request_repaint_after(ANIMATION_FRAME);
     }
 
     /// A word of the panel itself, in the warning colour (or the error's).
@@ -1023,7 +1027,7 @@ impl NoraPanel {
                 ui.add(Label::new(skin.text(format!("{}:{:02}", seconds / 60, seconds % 60), Face::Medium, 13.0, pal.text_2)).selectable(false));
             }
         });
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        ui.ctx().request_repaint_after(ANIMATION_FRAME);
     }
 }
 

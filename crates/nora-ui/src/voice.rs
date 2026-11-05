@@ -293,6 +293,9 @@ mod platform {
         started: Option<f64>,
         stopped_at: Option<f64>,
         peak: f32,
+        /// The analyser ever read a sample that is not digital silence: a context that was not running (a browser that
+        /// starts it only on a gesture) reads silence whatever is said, and then the quiet test says nothing.
+        saw_signal: bool,
         listening: bool,
         /// The person gave the recording up: nothing is kept.
         cancelled: bool,
@@ -386,6 +389,9 @@ mod platform {
             let Some(analyser) = shared.analyser.clone() else { return 0.0 };
             let mut samples = [128u8; 256];
             analyser.get_byte_time_domain_data(&mut samples);
+            if samples.iter().any(|sample| *sample != 128) {
+                shared.saw_signal = true;
+            }
             let mean_square = samples.iter().map(|sample| ((*sample as f32 - 128.0) / 128.0).powi(2)).sum::<f32>() / samples.len() as f32;
             // A voice at talking volume reads 0.05 to 0.3: stretched, so that the bars use their height.
             let level = (mean_square.sqrt() * 4.0).clamp(0.0, 1.0);
@@ -405,7 +411,8 @@ mod platform {
                     (Some(start), Some(end)) => (end - start) / 1000.0,
                     _ => min_seconds,
                 };
-                if seconds < min_seconds || shared.peak < quiet {
+                // The level is only trusted where the analyser ever heard something: a room is never digital silence.
+                if seconds < min_seconds || (shared.saw_signal && shared.peak < quiet) {
                     return Some(Recorded::Nothing);
                 }
             }
@@ -449,6 +456,8 @@ mod platform {
         let (audio, analyser) = match AudioContext::new() {
             Ok(audio) => match (audio.create_media_stream_source(&stream), audio.create_analyser()) {
                 (Ok(source), Ok(analyser)) => {
+                    // A browser that starts audio only on a gesture hands back a suspended context: the level would read nothing.
+                    let _ = audio.resume();
                     analyser.set_fft_size(512);
                     let _ = source.connect_with_audio_node(&analyser);
                     (Some(audio), Some(analyser))
