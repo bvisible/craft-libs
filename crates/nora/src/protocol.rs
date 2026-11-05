@@ -23,6 +23,13 @@ pub const CONFIRM_TEMPLATE: &str = "/api/method/nora.api.cards.confirm_template"
 /// a pane may answer (`nora.api.cards.answer_in_pane`); a template card keeps [`CONFIRM_TEMPLATE`], which every server
 /// that makes one has.
 pub const ANSWER_IN_PANE: &str = "/api/method/nora.api.cards.answer_in_pane";
+/// Turns what the person said into words (`nora.api.stt.transcribe`). The server method takes a multipart form; a pane's
+/// calls are JSON, so the host (the Drive's page, Neodesk) takes the recording as base64 in [`transcribe_body`] and makes the
+/// form itself, with the person's own credentials. A host that has no such door says so by not offering dictation.
+pub const STT_TRANSCRIBE: &str = "/api/method/nora.api.stt.transcribe";
+/// The largest recording a pane hands the server, as base64: two minutes of the browser's audio is some 600 KB; the hosts
+/// refuse a call over 4 MB.
+pub const MAX_AUDIO_BASE64: usize = 3_000_000;
 /// The largest PDF a pane hands Nora (`doc_export_pdf`, for an e-mail draft): sent in base64, a third more, through
 /// a page that refuses a call over 4 MB; the server takes no more either (`neoffice_theme.letters.mail`).
 pub const MAX_PDF_BYTES: usize = 2_500_000;
@@ -69,6 +76,37 @@ pub fn post_message_body(thread_id: &str, message: &str, context: &PageContext) 
 /// The body of `get_messages` and `get_browser_actions`.
 pub fn thread_body(thread_id: &str) -> Value {
     json!({ "thread_id": thread_id })
+}
+
+/// The body of the call that turns a recording into words: the recording (base64), its type (`audio/webm`…) and the
+/// language it is spoken in (two letters: the server's engine has no automatic detection).
+pub fn transcribe_body(audio_base64: &str, mime: &str, language: &str) -> Value {
+    json!({ "audio_base64": audio_base64, "mime": mime, "language": language })
+}
+
+/// What the speech engine writes when it heard nothing: on silence or room noise it answers with the credits of the
+/// subtitled videos it learnt from (seen on osiris, 06.10.2026: « Sous-titrage Société Radio-Canada » for a silent
+/// recording). Such a transcript is no dictation. The same list the Neoffice app keeps (`utils/dictation.ts`).
+pub fn is_phantom_transcript(text: &str) -> bool {
+    let said: String = text.trim().to_lowercase().trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '…') || c.is_whitespace()).to_string();
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    if said.is_empty() {
+        return true;
+    }
+    let starts = |prefix: &str| said.starts_with(prefix);
+    let is = |whole: &str| said == whole;
+    starts("sous-titrage ")
+        || starts("sous titrage ")
+        || is("sous-titres réalisés par la communauté d'amara.org")
+        || is("sous-titres realisés par la communauté d'amara.org")
+        || is("merci d'avoir regardé")
+        || is("merci d'avoir regardé cette vidéo")
+        || is("abonnez-vous")
+        || is("abonnez-vous à la chaîne")
+        || is("abonnez vous")
+        || is("thank you for watching")
+        || is("thanks for watching")
+        || is("subtitles by the amara.org community")
 }
 
 /// The body of `receive_observation`.
@@ -475,6 +513,19 @@ impl DocActionKind {
         self.modifies() || matches!(self, DocActionKind::Save | DocActionKind::Print | DocActionKind::ExportPdf | DocActionKind::ExportFile)
     }
 
+    /// What the action is, for a line that says what Nora is doing ([`Activity`]).
+    pub fn activity(&self) -> Activity {
+        match self {
+            DocActionKind::Observe | DocActionKind::RenderPage { .. } => Activity::Reading,
+            DocActionKind::Execute { .. }
+            | DocActionKind::Batch { .. }
+            | DocActionKind::SelectText { .. }
+            | DocActionKind::TypeText { .. }
+            | DocActionKind::Undo => Activity::Writing,
+            DocActionKind::Save | DocActionKind::Print | DocActionKind::ExportPdf | DocActionKind::ExportFile => Activity::Handing,
+        }
+    }
+
     /// A short sentence for the panel ("Run `format.bold`").
     pub fn summary(&self) -> String {
         match self {
@@ -499,6 +550,20 @@ fn shorten(text: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// What Nora is doing while a turn runs, for the panel's line under the conversation (« Nora is reading the document… »).
+/// `Thinking` is the time she spends away from the document: the model, the server's desks, a reply on its way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Activity {
+    #[default]
+    Thinking,
+    /// Reading the document or looking at a page of it.
+    Reading,
+    /// Changing it: a command, a selection, typing.
+    Writing,
+    /// Saving it, printing it, handing a file over.
+    Handing,
 }
 
 /// A document action and the observation id Nora is waiting on, if it is.

@@ -11,15 +11,34 @@ description = "egui panel to talk to Nora inside a Craft editor, on top of craft
 [lints]
 workspace = true
 
+# //// Neoffice — `cargo test -p craft-nora-ui --features preview -- --ignored` draws the pane to PNG files (NORA_PREVIEW_DIR):
+# the only way to look at what egui draws without a window. Off by default: it builds wgpu.
+[features]
+preview = ["egui_kittest/wgpu", "dep:image"]
+
 [dependencies]
 craft-nora = { workspace = true }
-# The editors and NeoMail (UCS's MailCraft) are on egui 0.37, like this workspace; the range still admits 0.36 for an app
-# that has not moved yet, and the panel is written to the API both share. Cargo keeps one egui per app: the one its lock has.
-egui = { version = ">=0.36, <0.38", default-features = false }
+# The editors and NeoMail (UCS's MailCraft) are on egui 0.37, like this workspace. The panel names widgets by their accesskit
+# `Role` (0.37), so 0.36 is no longer admitted. Cargo keeps one egui per app: the one its lock has.
+egui = { version = ">=0.37, <0.38", default-features = false }
 
-# //// Neoffice — the pane's state, remembered in the browser (launcher.rs, PaneMemory).
+# //// Neoffice — the pane's state remembered in the browser (launcher.rs, PaneMemory), and the microphone of its dictation
+# (voice.rs: getUserMedia, MediaRecorder, the voice's level).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["Window", "Storage"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window", "Storage", "Navigator", "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack", "MediaRecorder",
+    "MediaRecorderOptions", "RecordingState", "BlobEvent", "Blob", "BlobPropertyBag", "AudioContext", "AudioNode", "AnalyserNode",
+    "MediaStreamAudioSourceNode", "Performance",
+] }
+
+[dependencies.image]
+version = "0.25"
+optional = true
+default-features = false
+features = ["png"]
 
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }

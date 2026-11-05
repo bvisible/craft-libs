@@ -48,6 +48,6 @@ pub use error::NoraError;
 pub use http::{HttpRequest, HttpResponse, RequestId};
 pub use policy::{CommandPolicy, Decision};
 pub use proposal::{Field, FieldKind, Piece, Proposal, Ready, Reply, StyleState, parse_ready};
-pub use protocol::{Card, CardChoice, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
+pub use protocol::{Activity, Card, CardChoice, ChatMessage, CommandCall, DocAction, DocActionKind, RemoteAction, Role};
 pub use reply::{Segment, instance_path, segments};
-pub use session::{Confirmation, Correction, DocumentCall, Input, NoraSession, Output, SessionConfig, ShownCard};
+pub use session::{Confirmation, Correction, Dictation, DocumentCall, Input, NoraSession, Output, SessionConfig, ShownCard};

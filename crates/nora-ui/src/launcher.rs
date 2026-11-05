@@ -51,34 +51,10 @@ pub fn clay(dark: bool) -> Color32 {
     tone(dark).orb
 }
 
-/// Nora's sphere in `rect`, the Nora app's orb as NeoMail draws it: seven rings of latitude, the near half of each
-/// strong and the far half faint.
+/// Nora's sphere in `rect`: the design system's own (`assets/icons/nora-orb.svg`, thirteen rings of dust), as the pane
+/// and the desk draw it ([`crate::orb`]), at rest.
 pub fn paint_orb(painter: &Painter, rect: Rect, color: Color32) {
-    use std::f32::consts::PI;
-    const RINGS: usize = 7;
-    const STEPS: usize = 18;
-    let c = rect.center();
-    let r = rect.width().min(rect.height()) * 0.46;
-    if !r.is_finite() || r <= 0.0 {
-        return;
-    }
-    let width = (r * 0.11).max(0.9);
-    for k in 0..RINGS {
-        let latitude = ((k as f32 + 0.5) / RINGS as f32 - 0.5) * PI * 0.9;
-        let (sin, cos) = latitude.sin_cos();
-        let (y, rx) = (c.y + r * sin, r * cos);
-        let ry = rx * 0.342;
-        for (near, alpha) in [(true, 0.95), (false, 0.35)] {
-            let points: Vec<egui::Pos2> = (0..=STEPS)
-                .map(|i| {
-                    let a = PI * i as f32 / STEPS as f32;
-                    let a = if near { a } else { -a };
-                    pos2(c.x + rx * a.cos(), y + ry * a.sin())
-                })
-                .collect();
-            painter.add(egui::Shape::line(points, Stroke::new(width, color.gamma_multiply(alpha))));
-        }
-    }
+    crate::orb::paint(painter, rect, color, None);
 }
 
 /// What the button says, in the app's language: its words, and what its bubble says of Nora. English by default, as

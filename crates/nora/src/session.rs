@@ -9,9 +9,9 @@ use crate::error::NoraError;
 use crate::http::{HttpRequest, HttpResponse, RequestId, frappe_message};
 use crate::policy::{CommandPolicy, Decision};
 use crate::protocol::{
-    self, Addressee, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, addressees_of, card_answer_body, card_choice_body,
-    card_refusal_body, missed_of, observation_body, observation_error, observation_ok, parse_actions, parse_messages, post_message_body,
-    queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of, waits_of, work_of,
+    self, Activity, Addressee, Card, ChatMessage, DocAction, DocActionKind, RemoteAction, Role, addressees_of, card_answer_body, card_choice_body,
+    card_refusal_body, is_phantom_transcript, missed_of, observation_body, observation_error, observation_ok, parse_actions, parse_messages,
+    post_message_body, queued_at_of, sent_at_of, start_thread_body, thread_body, thread_id_of, transcribe_body, waits_of, work_of,
 };
 use crate::reply::instance_path;
 
@@ -83,6 +83,9 @@ pub struct SessionConfig {
     /// address of it in a reply is a page of the instance too ([`crate::reply::instance_path`]). `None` where the
     /// page is not the instance's (Neodesk): only a path is.
     pub instance_origin: Option<String>,
+    /// The language the person speaks when they dictate, two letters (`fr`, `en`, `de`…): the speech engine of the
+    /// server has no automatic detection. The editor sets it from its interface language.
+    pub language: String,
 }
 
 impl Default for SessionConfig {
@@ -99,6 +102,7 @@ impl Default for SessionConfig {
             settle_ms: 1_500,
             ack_anchors: protocol::ACK_ANCHORS.iter().map(|anchor| anchor.to_string()).collect(),
             instance_origin: None,
+            language: "fr".into(),
         }
     }
 }
@@ -134,6 +138,9 @@ pub enum Input {
     AnswerCard { token: String, approve: bool },
     /// The user picked one of the choices of a card that waits for them (a mailbox to write a draft from), by its id.
     ChooseOnCard { token: String, choice: String },
+    /// The person dictated a request: the recording (base64) and its type, to be turned into words
+    /// ([`NoraSession::dictation`]). It is not a message: nothing is sent to Nora until the person sends the words.
+    Transcribe { audio_base64: String, mime: String },
 }
 
 /// What a session asks of the host.
@@ -188,6 +195,21 @@ enum Pending {
     Observation,
     /// The person's answer to the card of this token.
     CardAnswer(String),
+    /// A recording on its way to be turned into words.
+    Transcription,
+}
+
+/// What came of a dictation: the words, or why there are none. The newest is [`NoraSession::dictation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dictation {
+    /// Counts the dictations of the session, from 1: a pane that has put the words of the n-th in its box does not put
+    /// them again.
+    pub id: u64,
+    /// What the person said. `None` when the engine heard nothing (it answered with the credits of a video: see
+    /// [`crate::protocol::is_phantom_transcript`]) or the call failed.
+    pub text: Option<String>,
+    /// Why the call failed, in the server's words or the connection's, when it did.
+    pub error: Option<String>,
 }
 
 /// How the last message's turn ended.
@@ -199,6 +221,7 @@ enum TurnEnd {
 
 struct Running {
     callback_id: Option<String>,
+    activity: Activity,
     modifies: bool,
     summary: String,
     /// The user's Undo of Nora's last change.
@@ -288,6 +311,9 @@ pub struct NoraSession {
     /// queue was last judged: an action that waited that long in the queue waited on the editor at work, not on a page
     /// that ran nothing.
     action_allowance_ms: u64,
+    /// The last dictation, and how many there were.
+    dictation: Option<Dictation>,
+    dictations: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -347,6 +373,8 @@ impl NoraSession {
             frozen_seen: false,
             action_done: false,
             action_allowance_ms: 0,
+            dictation: None,
+            dictations: 0,
         }
     }
 
@@ -366,6 +394,7 @@ impl NoraSession {
             Input::OpenLink(url) => self.on_open(&url, &mut out),
             Input::AnswerCard { token, approve } => self.on_answer_card(&token, approve, &mut out),
             Input::ChooseOnCard { token, choice } => self.on_choose_on_card(&token, &choice, &mut out),
+            Input::Transcribe { audio_base64, mime } => self.on_transcribe(&audio_base64, &mime, &mut out),
         }
         out
     }
@@ -457,6 +486,25 @@ impl NoraSession {
     /// The actions waiting for the user's yes or no.
     pub fn confirmations(&self) -> Vec<Confirmation> {
         self.waiting.iter().map(|w| Confirmation { id: w.id, summary: w.action.kind.summary(), kind: w.action.kind.clone() }).collect()
+    }
+
+    /// What Nora is doing now: working in the document (the action the editor is running), or away from it (`Thinking`).
+    pub fn activity(&self) -> Activity {
+        if !self.waiting.is_empty() {
+            return Activity::Thinking;
+        }
+        self.running.values().map(|run| run.activity).max().unwrap_or_default()
+    }
+
+    /// The last dictation: the words the server wrote down for a recording, or why it could not. It is for the pane to put
+    /// in its box ([`Dictation::id`] tells whether it has).
+    pub fn dictation(&self) -> Option<&Dictation> {
+        self.dictation.as_ref()
+    }
+
+    /// Whether a recording is on its way to be turned into words.
+    pub fn dictating(&self) -> bool {
+        self.inflight.values().any(|pending| matches!(pending, Pending::Transcription))
     }
 
     /// Whether a change Nora made can be undone.
@@ -555,7 +603,10 @@ impl NoraSession {
         }
         let nothing_running = self.running.is_empty() && self.waiting.is_empty();
         let nothing_pending = nothing_running
-            && self.inflight.values().all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions | Pending::CardAnswer(_)));
+            && self
+                .inflight
+                .values()
+                .all(|pending| matches!(pending, Pending::Observation | Pending::StoppedActions | Pending::CardAnswer(_) | Pending::Transcription));
         // Done first, so that a finished turn ends without one more poll. The final reply is in and the
         // actions queued with it have had their moment...
         // While the server says work goes on for the turn (a pole after the agent's answer), the turn reads on for what
@@ -659,9 +710,12 @@ impl NoraSession {
         }
     }
 
-    /// Time to the next read: often at first, then less, as the desk's chat does.
+    /// Time to the next read: often at first, then less, as the desk's chat does. The steps count from the last thing that
+    /// happened in the turn (a reply, an action started or done), not from its start: after fifteen seconds a turn was read
+    /// only every three, and its next action, which the model issues a second or two after the last one, waited 1.5 s on
+    /// average for the page to look (a turn is 3 to 8 round trips with the page, measured on osiris, 05.11.2026).
     fn poll_delay(&self, now_ms: u64) -> u64 {
-        match now_ms.saturating_sub(self.turn_started_ms) {
+        match now_ms.saturating_sub(self.last_activity_ms.max(self.turn_started_ms)) {
             0..3_000 => self.cfg.poll_fast_ms,
             3_000..15_000 => self.cfg.poll_mid_ms,
             _ => self.cfg.poll_slow_ms,
@@ -808,8 +862,38 @@ impl NoraSession {
                 self.last_failure = Some(error);
                 out.push(Output::Changed);
             }
+            (Pending::Transcription, Ok(message)) => {
+                self.dictations += 1;
+                let said = message.get("success").and_then(Value::as_bool).unwrap_or(false);
+                let text = message.get("text").and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty() && !is_phantom_transcript(text));
+                let error = (!said)
+                    .then(|| message.get("error").and_then(Value::as_str).unwrap_or("The server could not write down the recording").to_string());
+                self.dictation = Some(Dictation { id: self.dictations, text: text.filter(|_| said).map(str::to_string), error });
+                out.push(Output::Changed);
+            }
+            (Pending::Transcription, Err(error)) => {
+                self.dictations += 1;
+                self.dictation = Some(Dictation { id: self.dictations, text: None, error: Some(error.to_string()) });
+                out.push(Output::Changed);
+            }
             (Pending::StoppedActions | Pending::Observation, _) => {}
         }
+    }
+
+    /// The person dictated: the recording goes to be turned into words. A reply is no turn: nothing waits on it, and a
+    /// conversation under way goes on.
+    fn on_transcribe(&mut self, audio_base64: &str, mime: &str, out: &mut Vec<Output>) {
+        if audio_base64.is_empty() || audio_base64.len() > protocol::MAX_AUDIO_BASE64 {
+            self.dictations += 1;
+            self.dictation =
+                Some(Dictation { id: self.dictations, text: None, error: Some("The recording is too long: say it in two minutes or less".into()) });
+            out.push(Output::Changed);
+            return;
+        }
+        let body = transcribe_body(audio_base64, mime, &self.cfg.language);
+        let request = self.request(protocol::STT_TRANSCRIBE, body, Pending::Transcription);
+        out.push(request);
+        out.push(Output::Changed);
     }
 
     fn fail(&mut self, error: NoraError, out: &mut Vec<Output>) {
@@ -1111,7 +1195,16 @@ impl NoraSession {
         }
         let id = self.new_id();
         let undo = action.kind == DocActionKind::Undo;
-        self.running.insert(id, Running { callback_id: action.callback_id, modifies: action.kind.modifies(), summary: action.kind.summary(), undo });
+        self.running.insert(
+            id,
+            Running {
+                callback_id: action.callback_id,
+                activity: action.kind.activity(),
+                modifies: action.kind.modifies(),
+                summary: action.kind.summary(),
+                undo,
+            },
+        );
         self.last_activity_ms = self.now_ms;
         out.push(Output::Document(DocumentCall { id, kind: action.kind }));
     }
@@ -1127,6 +1220,11 @@ impl NoraSession {
         };
         self.action_done = true;
         self.last_activity_ms = self.now_ms;
+        // The model issues its next action a second or two after the answer to this one: the next read, scheduled before
+        // this action ran at the pace of the silence, comes soon instead.
+        if let Some(due) = self.next_poll_ms {
+            self.next_poll_ms = Some(due.min(self.now_ms.saturating_add(self.cfg.poll_fast_ms)));
+        }
         let observation = match result {
             Ok(value) => {
                 if run.modifies && value.get("changed") != Some(&Value::Bool(false)) {

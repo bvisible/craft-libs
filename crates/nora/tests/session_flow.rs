@@ -377,7 +377,8 @@ fn a_late_answer_that_comes_after_the_next_message_is_shown_without_ending_it() 
     assert_eq!(nora.transcript().last().map(|m| m.text.as_str()), Some("Réponse au premier message."));
     nora.handle(ok(&post, json!({"thread_id": "t1", "sent_at": 1_500.0})));
     poll(&mut nora, 497_000, json!([late]), json!([]));
-    nora.handle(Input::Tick { now_ms: 499_000 });
+    // (The session reads often while something has just happened in the turn: the read of 499 s is answered like the rest.)
+    poll(&mut nora, 499_000, json!([late]), json!([]));
     assert!(nora.is_busy(), "the late answer is the first message's");
     let answer = json!({"role": "assistant", "text": "Réponse au second.", "ts": 1_600.0});
     poll(&mut nora, 500_000, json!([late, answer]), json!([]));
@@ -1659,4 +1660,26 @@ fn a_long_action_is_no_freeze() {
     poll(&mut idle, 100, json!([]), json!([]));
     let late = poll_queue(&mut idle, 90_100, json!({"actions": [type_text("c3")], "queued_at": [1_002.0], "now": 1_092.0}));
     assert!(documents(&late).is_empty() && refused_with(&late, "c3").contains("background"));
+}
+
+/// The reads follow what happens in the turn, not the clock of its start: after a reply, or an action that ran, the
+/// next read is soon again, even half a minute into the turn (the model issues its next action a second or two later).
+#[test]
+fn reads_come_often_again_right_after_something_happened_late_in_a_turn() {
+    let mut nora = started_at(1_000.0);
+    // Half a minute of silence, read as the pane does: the step grows to the slow one.
+    let mut now = nora.next_wake_ms().expect("a read is awaited");
+    let mut slow = 0;
+    while now < 30_000 {
+        let before = now;
+        poll(&mut nora, now, json!([]), json!([]));
+        now = nora.next_wake_ms().expect("a read is awaited");
+        slow = now - before;
+    }
+    let outputs = poll(&mut nora, now, json!([]), json!([{"action": "doc_observe", "callback_id": "c1"}]));
+    let call = documents(&outputs)[0].id;
+    nora.handle(Input::DocumentResult { id: call, result: Ok(json!({"ok": true})) });
+    let next = nora.next_wake_ms().expect("a read is awaited");
+    assert!(next - now <= 1_000, "right after an action the next read is soon: {} after the action, {slow} in silence", next - now);
+    assert!(slow >= 2_000, "silence is read slowly: {slow}");
 }

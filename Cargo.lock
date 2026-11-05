@@ -962,7 +962,11 @@ dependencies = [
  "craft-nora",
  "egui",
  "egui_kittest",
+ "image",
+ "js-sys",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
