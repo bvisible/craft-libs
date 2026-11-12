@@ -8,8 +8,9 @@
 //!
 //! Search order: the folder set with [`set_dictionary_dir`], the directory in
 //! `WORDCRAFT_DICTIONARIES`, WordCraft's own `dictionaries` folder under the user's application
-//! data (on every desktop system), then an installed Language pack ([`crate::packs`]), then the
-//! usual system locations. On the web there are only the first and the packs.
+//! data (on every desktop system), then (for a Language pack language) the dictionary the program
+//! carries ([`crate::embedded`]), an installed Language pack ([`crate::packs`]), then the
+//! usual system locations. On the web there are only the first and the packs, and what the program carries.
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -40,6 +41,11 @@ pub fn note_load<T>(key: &str, dic: &Path, result: Result<T, String>) -> Result<
 /// Forget the load error of the dictionary `key` (none found, or it is about to be searched for again).
 pub fn clear_load_error(key: &str) {
     LOAD_ERRORS.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(k, _, _)| k != key);
+}
+
+// //// Neoffice — every remembered load error, for a change of what the dictionaries are read from (an embedded dictionary was registered).
+pub(crate) fn clear_load_errors() {
+    LOAD_ERRORS.write().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
 /// The `.dic` file and the reason of the last failed load of the dictionary `key`, if any.

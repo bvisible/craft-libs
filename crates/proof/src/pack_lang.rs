@@ -1,6 +1,7 @@
 //! Proofing for any language by its locale ([`crate::ProofLang::Pack`]): its Hunspell dictionary (the
-//! dictionaries folder, then an installed Language pack, then the system's), read by the shared
-//! affix engine, with default suggestion tuning and no grammar rules.
+//! dictionaries folder the user set, then one the program carries ([`crate::embedded`]), then an installed
+//! Language pack, then the system's), read by the shared affix engine, with its own suggestion ranking
+//! ([`crate::pack_suggest`]) and no grammar rules (French has repeated-word and spacing checks).
 //!
 //! The loaded dictionaries share a memory budget ([`MAX_LOADED_BYTES`], estimated from their
 //! files); the one used least recently goes first, but never one used during the current
@@ -14,7 +15,8 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+// //// Neoffice — `Mutex`: the lock held while a dictionary is read (see `LOADING`).
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::affix::AffixDict;
 use crate::affix_suggest::Tuning;
@@ -29,7 +31,7 @@ const MAX_MISSING: usize = 256;
 
 /// The budget in force (tests lower it).
 static BUDGET: AtomicU64 = AtomicU64::new(MAX_LOADED_BYTES);
-/// Dictionaries loaded from disk so far (tests count them).
+/// Dictionaries read and parsed so far, from disk or from the program (tests count them).
 static LOADS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -44,6 +46,9 @@ struct Loaded {
     scripts: Arc<[u32]>,
     /// The `.dic` it came from.
     file: Option<PathBuf>,
+    // //// Neoffice — the locales of one embedded language share one parsed dictionary.
+    /// The tag of the embedded dictionary it is ([`crate::embedded`]): the locales of one language share it.
+    embedded: Option<String>,
     /// Estimated memory.
     bytes: u64,
     used: u64,
@@ -249,22 +254,90 @@ fn get(locale: PackLocale) -> (Arc<AffixDict>, Option<PathBuf>) {
     (d, file)
 }
 
+// //// Neoffice — the cache lookup, the read lock and the sources (folders, embedded, packs) are split out of `get_with_scripts` (see `choose`).
+/// The loaded dictionary of `locale` (or the knowledge that it has none), when the cache has it: the lookup counts as a use.
+type Found = (Arc<AffixDict>, Option<PathBuf>, Arc<[u32]>);
+
+fn cached(locale: PackLocale) -> Option<Found> {
+    let mut c = CACHE.write().unwrap_or_else(PoisonError::into_inner);
+    c.clock = c.clock.wrapping_add(1);
+    let now = c.clock;
+    if let Some(l) = c.loaded.iter_mut().find(|l| l.locale == locale) {
+        l.used = now;
+        let (found, group) = ((l.dict.clone(), l.file.clone(), l.scripts.clone()), l.embedded.clone());
+        // A locale that shares an embedded dictionary keeps its twins in use: they are evicted together.
+        if let Some(tag) = group {
+            c.loaded.iter_mut().filter(|l| l.embedded.as_deref() == Some(tag.as_str())).for_each(|l| l.used = now);
+        }
+        return Some(found);
+    }
+    c.missing.contains(&locale).then(|| (Arc::default(), None, Arc::from([])))
+}
+
+/// One lock per dictionary being read (its embedded tag, or its locale), held while it is read and parsed, so that threads
+/// asking for the same one at once wait for a single read instead of each parsing megabytes (a large dictionary takes a tenth of a
+/// second or more): whoever comes next finds it cached. Another language's first use does not wait for it.
+static LOADING: Mutex<Vec<(String, Arc<Mutex<()>>)>> = Mutex::new(Vec::new());
+
+/// The lock of the dictionary `key`.
+fn loading_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = LOADING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, lock)) = locks.iter().find(|(k, _)| k == key) {
+        return lock.clone();
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.push((key.to_string(), lock.clone()));
+    lock
+}
+
+/// Most locales that share one embedded dictionary are cached beside the one that parsed it (more are answered the same way, uncached).
+const MAX_TWINS: usize = 16;
+
 /// [`get`], with the dictionary's [`scripts`].
-fn get_with_scripts(locale: PackLocale) -> (Arc<AffixDict>, Option<PathBuf>, Arc<[u32]>) {
-    let reloads = {
+fn get_with_scripts(locale: PackLocale) -> Found {
+    // //// Neoffice — the cache first, then one reader at a time (`LOADING`), and the source of an embedded dictionary (`Source`) shared by its locales.
+    if let Some(found) = cached(locale) {
+        return found;
+    }
+    let reloads = CACHE.read().unwrap_or_else(PoisonError::into_inner).reloads;
+    // //// Neoffice — the source is chosen before anything is parsed (`choose`), and one thread reads each dictionary at a time (`LOADING`).
+    let source = choose(locale);
+    let lock = loading_lock(&match &source {
+        Source::Embedded(e) => format!("embedded {}", e.tag()),
+        _ => locale.as_str().to_string(),
+    });
+    let _loading = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = cached(locale) {
+        return found;
+    }
+    // //// Neoffice — another locale of the same embedded language already holds this dictionary: share it, parse nothing.
+    if let Source::Embedded(e) = &source {
         let mut c = CACHE.write().unwrap_or_else(PoisonError::into_inner);
-        c.clock = c.clock.wrapping_add(1);
-        let now = c.clock;
-        if let Some(l) = c.loaded.iter_mut().find(|l| l.locale == locale) {
-            l.used = now;
-            return (l.dict.clone(), l.file.clone(), l.scripts.clone());
+        let twin = c.loaded.iter().find(|l| l.embedded.as_deref() == Some(e.tag())).map(|l| (l.dict.clone(), l.scripts.clone()));
+        if let Some((dict, scripts)) = twin {
+            let twins = c.loaded.iter().filter(|l| l.embedded.as_deref() == Some(e.tag())).count();
+            if c.reloads == reloads && twins < MAX_TWINS {
+                let used = c.clock;
+                c.loaded.push(Loaded {
+                    locale,
+                    dict: dict.clone(),
+                    scripts: scripts.clone(),
+                    file: None,
+                    embedded: Some(e.tag().to_string()),
+                    bytes: 0,
+                    used,
+                });
+            }
+            return (dict, None, scripts);
         }
-        if c.missing.contains(&locale) {
-            return (Arc::default(), None, Arc::from([]));
-        }
-        c.reloads
+    }
+    // //// Neoffice — the dictionary is parsed from its source (`parse`); an embedded one is noted so that its twins can share it.
+    let (dict, file, bytes) = parse(locale, &source);
+    let embedded = match &source {
+        Source::Embedded(e) if !dict.is_empty() => Some(e.tag().to_string()),
+        _ => None,
     };
-    let (dict, file, bytes) = load(locale);
+    // //// Neoffice — (the dictionary was read by `parse` above; the scripts of its words are looked at once it is there.)
     let scripts = scripts(&dict);
     let mut c = CACHE.write().unwrap_or_else(PoisonError::into_inner);
     if c.reloads != reloads || c.loaded.iter().any(|l| l.locale == locale) || c.missing.contains(&locale) {
@@ -285,28 +358,89 @@ fn get_with_scripts(locale: PackLocale) -> (Arc<AffixDict>, Option<PathBuf>, Arc
         };
         let gone = c.loaded.swap_remove(oldest);
         total = total.saturating_sub(gone.bytes);
+        // //// Neoffice — the locales that share an embedded dictionary go with it: the memory is released only when none holds it.
+        if let Some(tag) = gone.embedded {
+            c.loaded.retain(|l| l.embedded.as_deref() != Some(tag.as_str()));
+            total = c.loaded.iter().map(|l| l.bytes).sum();
+        }
     }
     let used = c.clock;
-    c.loaded.push(Loaded { locale, dict: dict.clone(), scripts: scripts.clone(), file: file.clone(), bytes, used });
+    // //// Neoffice — `embedded`: which embedded dictionary it is, if one.
+    c.loaded.push(Loaded { locale, dict: dict.clone(), scripts: scripts.clone(), file: file.clone(), embedded, bytes, used });
     (dict, file, scripts)
 }
 
-/// Load `locale`'s dictionary, with its estimated memory.
-fn load(locale: PackLocale) -> (Arc<AffixDict>, Option<PathBuf>, u64) {
+// //// Neoffice — the sources of a locale's dictionary, with the one the program carries between the user's folders and the packs.
+/// Where a locale's dictionary comes from, in the order they are tried: the dictionaries folders the user set, the dictionary
+/// the program carries ([`crate::embedded`]), then an installed Language pack or the system's Hunspell dictionaries.
+enum Source {
+    Files(PathBuf, PathBuf),
+    Embedded(Arc<crate::embedded::Entry>),
+    None,
+}
+
+/// The first source `locale` has. A dictionary in a folder the user set wins over the embedded one; if that file
+/// can't be read, [`parse`] falls back to the embedded one when there is one.
+fn choose(locale: PackLocale) -> Source {
+    // //// Neoffice — the user's dictionaries folders, then the embedded dictionary, then installed packs and the system's.
     let names = names(locale);
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    if let Some((aff, dic)) = crate::hunspell::user_dirs().iter().find_map(|dir| crate::hunspell::find_in(dir, &refs)) {
+        return Source::Files(aff, dic);
+    }
+    if let Some(e) = crate::embedded::find(&hyphenation_locales(locale)) {
+        return Source::Embedded(e);
+    }
+    match crate::hunspell::find(&refs) {
+        Some((aff, dic)) => Source::Files(aff, dic),
+        None => Source::None,
+    }
+}
+
+/// Read and parse `source`'s dictionary for `locale`, with its estimated memory. A file that can't be read leaves its reason
+/// ([`load_error`]); the embedded dictionary, if there is one, is used then.
+fn parse(locale: PackLocale, source: &Source) -> (Arc<AffixDict>, Option<PathBuf>, u64) {
+    let names = names(locale);
     let key = names.first().map_or("", String::as_str);
-    let Some((aff, dic)) = crate::hunspell::find(&refs) else {
-        crate::hunspell::clear_load_error(key);
-        return (Arc::default(), None, 0);
-    };
-    let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
-    let bytes = size(&aff).saturating_add(size(&dic)).saturating_mul(BYTES_PER_FILE_BYTE).max(1);
-    match crate::hunspell::note_load(key, &dic, crate::hunspell::load(&aff, &dic)) {
-        Ok(d) => (Arc::new(d), Some(dic), bytes),
-        Err(e) => {
-            log::warn!("{locale} spelling: {e}");
+    // //// Neoffice — an embedded dictionary is inflated and parsed here; a failure leaves its reason like an installed file's.
+    let embedded = |e: &crate::embedded::Entry| match e.parse() {
+        Ok((d, size)) => {
+            crate::hunspell::clear_load_error(key);
+            (Arc::new(d), None, size.saturating_mul(BYTES_PER_FILE_BYTE).max(1))
+        }
+        Err(reason) => {
+            log::warn!("{locale} spelling: {reason}");
+            let _ = crate::hunspell::note_load::<()>(key, std::path::Path::new(&e.file_name()), Err(reason));
             (Arc::default(), None, 0)
+        }
+    };
+    // //// Neoffice — what each source reads (it was one `load` of the files found).
+    match source {
+        Source::Embedded(e) => embedded(e),
+        Source::None => {
+            crate::hunspell::clear_load_error(key);
+            (Arc::default(), None, 0)
+        }
+        // //// Neoffice — installed files, as `load` read them, with the embedded dictionary as a fallback.
+        Source::Files(aff, dic) => {
+            let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+            let bytes = size(aff).saturating_add(size(dic)).saturating_mul(BYTES_PER_FILE_BYTE).max(1);
+            match crate::hunspell::note_load(key, dic, crate::hunspell::load(aff, dic)) {
+                Ok(d) => (Arc::new(d), Some(dic.clone()), bytes),
+                Err(e) => {
+                    log::warn!("{locale} spelling: {e}");
+                    // The reason stays for File › Options; the program's own dictionary, if it carries one, is used meanwhile.
+                    match crate::embedded::find(&hyphenation_locales(locale)) {
+                        Some(emb) => {
+                            let (d, file, size) = embedded(&emb);
+                            // `embedded` forgot the load error of the file: put it back.
+                            let _ = crate::hunspell::note_load::<()>(key, dic, Err(e));
+                            (d, file, size)
+                        }
+                        None => (Arc::default(), None, 0),
+                    }
+                }
+            }
         }
     }
 }
@@ -416,6 +550,42 @@ mod tests {
         assert!(!other_script("щщщ", &scripts(&ru)) && other_script("dom", &scripts(&ru)));
         assert_ne!(script_of('ა'), script_of('a'));
         assert_eq!(script_of('ă'), script_of('Ạ'));
+    }
+
+    // //// Neoffice — what decorates a word is not the word.
+    /// What decorates a word is not the word: a unit's exponent, and an elision before an acronym, a number or the user's word.
+    #[test]
+    fn units_with_exponents_and_elided_acronyms_are_right() {
+        crate::hold_dictionary_tests();
+        crate::embedded::forget_dictionaries();
+        let aff = "SET UTF-8\nPFX L Y 2\nPFX L 0 l' [aeiouéAEIOUÉ]\nPFX L 0 d' [aeiouéAEIOUÉ]\nPFX Q Y 1\nPFX Q 0 qu' [aeiouéAEIOUÉ]\n";
+        crate::embedded::embed_dictionary(
+            "zv",
+            "Test",
+            aff.as_bytes().to_vec(),
+            "6\nkm/\nm\nécole/LQ\nami/LQ\nhomme/LQ\ncafé\n".as_bytes().to_vec(),
+            crate::embedded::Packing::Plain,
+        )
+        .unwrap();
+        let lang = crate::ProofLang::from_tag(Some("zv-AA"));
+        let strict = crate::Options { ignore_uppercase: false, ignore_numbers: false, ignore_internet: false };
+        let ok = |w: &str, o: &crate::Options| crate::is_correct_in_with(w, lang, o);
+        let defaults = crate::Options::default();
+        for w in ["km²", "m³", "km²-m³", "café²", "l'OTAN", "d\u{2019}IBM", "L'OTAN", "qu'IBM", "l'école", "l'2e", "d'OTAN-café"] {
+            assert!(ok(w, &defaults), "{w}");
+        }
+        for w in ["l'xyzzy", "x'OTAN", "l'OTANNNNNNNNNN", "kmx²", "xyz²", "l'OTAN-xyzzy", "qu'xyzzy"] {
+            assert!(!ok(w, &defaults), "{w}");
+        }
+        // The options that skip acronyms are what let one after an elision pass; looked up it is a word or it is not.
+        assert!(!ok("l'OTAN", &strict) && ok("km²", &strict) && ok("l'école", &strict));
+        // The user's word after an elision, alone or as a part.
+        assert!(!ok("d'Zqapple", &defaults) && !ok("d'Zqapple-café", &defaults));
+        crate::add_word("Zqapple");
+        assert!(ok("d'Zqapple", &strict) && ok("l\u{2019}Zqapple", &strict) && ok("d'Zqapple-café", &strict) && ok("café-d'Zqapple", &strict));
+        assert!(!ok("x'Zqapple", &strict) && !ok("d'Zqapplee", &strict));
+        crate::remove_word("Zqapple");
+        crate::embedded::forget_dictionaries();
     }
 
     #[test]

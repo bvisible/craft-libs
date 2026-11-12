@@ -46,6 +46,8 @@
 //!   from its Hunspell dictionary (an installed Language pack, the dictionaries folder or the
 //!   system's) with default tuning, hyphenation from its pack, no grammar rules; without a
 //!   dictionary no marks, like Word without the language's proofing tools.
+//!   A program that can't read a folder or download a pack (a browser build) carries a language's dictionary
+//!   itself: [`embedded::embed_dictionary`].
 //! - **No language** ([`ProofLang::Other`]: `x-none`, `zxx`, malformed tags): no marks.
 //! - **Hyphenation** ([`hyphen`]): dictionary, Liang patterns (English, Polish, Portuguese,
 //!   Italian, German), Bulgarian syllable rules, Russian word-division rules, heuristic.
@@ -70,6 +72,8 @@ mod data {
 pub mod bg;
 pub mod cs;
 pub mod dict;
+// //// Neoffice — added: the dictionaries a program carries inside itself (a browser build reads no folder).
+pub mod embedded;
 pub mod en_variants;
 mod english;
 pub mod es;
@@ -335,6 +339,13 @@ pub fn set_dictionaries_folder(dir: Option<std::path::PathBuf>) {
 
 /// Forget every loaded dictionary, so the next check looks for them again (the dictionaries
 /// folder or the installed Language packs changed), and check text again.
+// //// Neoffice — a pack language's dictionaries only: registering an embedded dictionary must not drop the ones the other languages
+// hold in memory (`install_dictionary`: a browser build has no other source for them).
+pub(crate) fn reload_pack_dictionaries() {
+    pack_lang::reload();
+    DICTIONARY_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn reload_dictionaries() {
     for l in &LANGUAGES {
         l.slot.reload();
@@ -345,8 +356,9 @@ pub(crate) fn reload_dictionaries() {
 }
 
 /// The `.dic` file a [`ProofLang::Pack`] language's (or German's or Bulgarian's) spelling is read from now (the dictionaries
-/// folder, an installed Language pack or the system's); `None` when it has none (unchecked) or
-/// `lang` isn't a pack language. Reads the dictionary once (it is cached afterwards).
+/// folder, an installed Language pack or the system's); `None` when it has none, when a dictionary the program carries
+/// ([`embedded`]) is read instead (it has no file: [`embedded::label`] names it), or when `lang` isn't a pack language.
+/// Reads the dictionary once (it is cached afterwards).
 pub fn pack_dictionary_file(lang: ProofLang) -> Option<std::path::PathBuf> {
     pack_lang::dictionary_file(lang.spelling_locale()?)
 }

@@ -231,7 +231,7 @@ impl ProofLang {
         }
     }
 
-    /// The locale whose Hunspell dictionary (dictionaries folder, Language pack, system) spells
+    /// The locale whose Hunspell dictionary (dictionaries folder, embedded dictionary, Language pack, system) spells
     /// this language through the shared affix engine: a [`ProofLang::Pack`] language's own, and
     /// German's and Bulgarian's, which have hyphenation (and Bulgarian rules) of their own but no
     /// dictionary slot. `None` for the languages with a slot of their own, English and `Other`.
