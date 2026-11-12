@@ -4,9 +4,10 @@
 //!
 //! - a first letter is seldom the wrong one, so a candidate that changes it ranks after those that fix the rest
 //!   (`rendez-vou` is `rendez-vous`, not `rendez-cou`);
-//! - a missing apostrophe in front of a word that needs a correction too (`dacord` is `d'accord`, `lecole` is `l'école`),
-//!   where an elision is a prefix the dictionary's rules add that ends with an apostrophe (French `l'`, `d'`, `qu'`, Italian
-//!   `dell'`); the shared ranking offers the elision of a word that is right as it stands;
+//! - a missing apostrophe: in a short word the elision comes first (`jai` is `j'ai`, `cest` is `c'est`: it is far likelier the meaning than
+//!   `Jay` or `cet`), and in front of a word that needs a correction too it comes after the two best (`dacord` is `d'accord`, `lecole` is
+//!   `l'école`), where an elision is a prefix the dictionary's rules add that ends with an apostrophe (French `l'`, `d'`, `qu'`, Italian
+//!   `dell'`); in a longer word the shared ranking puts it where the cost says (`dosier` is `dossier` before `d'osier`);
 //! - the wrong part of a hyphenated word (`parle-t-ill` is `parle-t-il`), the hyphenated words the dictionary breaks at the
 //!   hyphen being right when each part is ([`crate::pack_lang::is_correct`]).
 
@@ -22,6 +23,9 @@ fn mistype_cost(_: &[char], at: usize, _: char) -> u32 {
 
 /// Longest elided first part tried, in letters (`quoiqu'`, `lorsqu'`, `quell'`).
 const MAX_ELIDED: usize = 7;
+
+/// A word of at most this many letters, once its apostrophe is missing, is read as the elision first.
+const SHORT_WORD: usize = 5;
 
 /// Spelling suggestions for `word` against `d`, best first, at most `max`, in the word's letter case.
 pub(crate) fn suggest(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
@@ -48,8 +52,14 @@ pub(crate) fn suggest(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
             add(&mut out, s, true);
         }
     }
-    // The elision of a word that needs a correction too ranks after the two best of the shared ranking.
-    let mut guesses = if word.contains(['\'', '-']) { Vec::new() } else { elided(d, &word) };
+    // The elision of a short word that is right with its apostrophe comes first; that of a word that needs a correction too ranks after
+    // the two best of the shared ranking.
+    let (sure, mut guesses) = if word.contains(['\'', '-']) { (Vec::new(), Vec::new()) } else { elided(d, &word) };
+    if word.chars().count() <= SHORT_WORD {
+        for s in sure {
+            add(&mut out, s, true);
+        }
+    }
     for (i, s) in suggest_in(d, &word, max, &TUNING).into_iter().enumerate() {
         if i == 2 {
             for g in std::mem::take(&mut guesses) {
@@ -66,10 +76,11 @@ pub(crate) fn suggest(d: &AffixDict, word: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// The elisions of a word that also needs a correction (`d'accord` for `dacord`: `acord` is not a word, its first suggestion is).
-fn elided(d: &AffixDict, word: &str) -> Vec<String> {
+/// The elisions of a word: those the dictionary takes as they stand (`j'ai` for `jai`: sure), and those of a word that also needs a
+/// correction (`d'accord` for `dacord`: `acord` is not a word, its first suggestion is).
+fn elided(d: &AffixDict, word: &str) -> (Vec<String>, Vec<String>) {
     let lower = word.to_lowercase();
-    let mut out = Vec::new();
+    let (mut sure, mut out) = (Vec::new(), Vec::new());
     for head in d.elisions().into_iter().filter(|h| h.chars().count() <= MAX_ELIDED) {
         let n = head.chars().count();
         if !lower.starts_with(head.as_str()) || word.chars().count() <= n {
@@ -77,7 +88,12 @@ fn elided(d: &AffixDict, word: &str) -> Vec<String> {
         }
         let split = word.char_indices().nth(n).map_or(word.len(), |(i, _)| i);
         let (Some(h), Some(rest)) = (word.get(..split), word.get(split..)) else { continue };
-        if rest.chars().count() < 3 || d.can_suggest(&format!("{h}'{rest}")) {
+        let candidate = format!("{h}'{rest}");
+        if d.can_suggest(&candidate) {
+            sure.push(candidate);
+            continue;
+        }
+        if rest.chars().count() < 3 {
             continue;
         }
         for s in suggest_in(d, rest, 2, &TUNING) {
@@ -87,7 +103,7 @@ fn elided(d: &AffixDict, word: &str) -> Vec<String> {
             }
         }
     }
-    out
+    (sure, out)
 }
 
 /// A hyphenated word with one wrong part: the part is corrected and the word put together again, if the dictionary takes it.
@@ -113,8 +129,9 @@ mod tests {
     use super::*;
 
     fn dict() -> AffixDict {
-        let aff = "SET UTF-8\nTRY abcdefghijklmnopqrstuvwxyzé\nICONV 1\nICONV ’ '\nOCONV 1\nOCONV ' ’\nMAP 1\nMAP eé\nPFX D Y 1\nPFX D 0 d' [aeiouéh]\nPFX L Y 1\nPFX L 0 l' [aeiouéh]\nSFX S Y 1\nSFX S 0 s .\n";
-        AffixDict::from_hunspell(aff, "12\naccord/D\nécole/DLS\nil\nparle\nt\nvous/S\ncous\ntous\nbout\nest\nrendez\nmidi\n", &[]).unwrap()
+        let aff = "SET UTF-8\nTRY abcdefghijklmnopqrstuvwxyzé\nICONV 1\nICONV ’ '\nOCONV 1\nOCONV ' ’\nMAP 2\nMAP eé\nMAP iy\nPFX D Y 1\nPFX D 0 d' [aeiouéh]\nPFX L Y 1\nPFX L 0 l' [aeiouéh]\nPFX J Y 1\nPFX J 0 j' [aeiouéh]\nPFX C Y 1\nPFX C 0 c' [aeiouéh]\nSFX S Y 1\nSFX S 0 s .\n";
+        AffixDict::from_hunspell(aff, "15\naccord/D\nécole/DLS\nil\nparle\nt\nvous/S\ncous\ntous\nbout\nest/C\nrendez\nmidi\nai/J\nJay\ncet\n", &[])
+            .unwrap()
     }
 
     #[test]
@@ -126,6 +143,19 @@ mod tests {
         // A word that has its apostrophe or its hyphen is not elided again.
         let again = suggest(&d, "d'acord", 4);
         assert!(again.contains(&"d’accord".to_string()) && again.iter().all(|s| s.matches('’').count() <= 1), "{again:?}");
+    }
+
+    /// A short word with its apostrophe missing is read as the elision first (`jai` is `j'ai`, not the name `Jay`; `cest` is `c'est`, not `cet`);
+    /// a longer one is left to the shared ranking.
+    #[test]
+    fn the_elision_of_a_short_word_comes_first() {
+        let d = dict();
+        assert_eq!(suggest(&d, "jai", 3).first().map(String::as_str), Some("j’ai"), "{:?}", suggest(&d, "jai", 3));
+        assert_eq!(suggest(&d, "cest", 3).first().map(String::as_str), Some("c’est"), "{:?}", suggest(&d, "cest", 3));
+        assert_eq!(suggest(&d, "Jai", 3).first().map(String::as_str), Some("J’ai"), "{:?}", suggest(&d, "Jai", 3));
+        // The suggestions are not repeated.
+        let found = suggest(&d, "jai", 8);
+        assert_eq!(found.iter().filter(|s| s.as_str() == "j’ai").count(), 1, "{found:?}");
     }
 
     #[test]
