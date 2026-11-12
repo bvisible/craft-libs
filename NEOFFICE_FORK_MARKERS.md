@@ -10,12 +10,15 @@ picture of what is ours and why.
 
 ## Base of the divergence
 
-Last upstream merge: `storytold/craft-libs` `main` at `ea1fbeb` (2026-11-02, 410 commits after the previous base
-`7895f5e` of 2026-10-24). `git merge-base HEAD upstream/main` gives the base the marker check (CI "Neoffice fork
-markers") compares against. That merge changed none of upstream's code. It moved the workspace to egui 0.37 (on
-upstream's own `[patch]` of the storytold egui fork), so our two crates changed in three places only: the `egui_kittest`
-dev-dependency of `craft-nora-ui` (`0.36` to `0.37`), a renamed accessibility role in one of its tests
-(`WidgetType::Button` to `Role::Button`), and the comments that said the workspace was on 0.36.
+Last upstream merge: `storytold/craft-libs` `main` at `c6db9e8` (2026-11-12, 824 commits after the previous base
+`ea1fbeb` of 2026-11-02). `git merge-base HEAD upstream/main` gives the base the marker check (CI "Neoffice fork
+markers") compares against. That merge changed none of upstream's code and none of ours: the workspace stays on egui 0.37
+(on upstream's own `[patch]` of the storytold egui fork, same revision), and upstream's moves of the previous weeks touch
+neither crate of ours (`craft_update::install_package` gained a `bundle` parameter and `craft_text`'s `Dictionary::to_bytes`
+returns a `Result`; our crates call neither). Three files conflicted, each because both sides appended to the same place:
+`Cargo.toml` (our two workspace dependency lines kept beside upstream's new crates), `README.md` (our two crate entries
+kept beside upstream's new ones) and `Cargo.lock` (upstream's taken, then `cargo check` wrote our two entries back).
+Upstream's README lists `craft-mesh` with a duplicated line (a defect of theirs, left as it came).
 
 ## What the fork adds
 
