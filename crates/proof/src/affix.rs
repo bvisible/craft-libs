@@ -923,6 +923,16 @@ impl<'a> FlagProbe<'a> {
     }
 }
 
+// //// Neoffice — the prefixes taken off a word with their continuation classes, so that a suffix they license counts (see `suffixed`).
+/// The prefixes taken off a word, as the suffix check that follows needs them.
+struct Prefixes<'a> {
+    /// Their flags.
+    flags: FlagProbe<'a>,
+    /// The flag and the continuation classes' set id of each one that has classes: what it hands
+    /// down to a suffix ([`AffixDict::suffixed`]).
+    handing: &'a [(u16, u32)],
+}
+
 // ponytail: a thread-local rather than a parameter through every check path; the guard below
 // restores it, so nested or concurrent calls on other threads don't share it.
 thread_local! {
@@ -2025,7 +2035,8 @@ impl AffixDict {
             .filter_map(|&i| self.prefixes.get(i as usize));
         // What each rule leaves: (root, circumfix, needs another affix, cross, flag). The rules
         // that leave the same root alike are answered together, in one walk each.
-        let mut taken: Vec<(String, bool, bool, bool, u16)> = Vec::new();
+        // //// Neoffice — each prefix rule's continuation classes too (see `suffixed`).
+        let mut taken: Vec<(String, bool, bool, bool, u16, u32)> = Vec::new();
         for r in rules {
             if !steps.spend(1 + r.cond.len()) {
                 return false;
@@ -2038,12 +2049,15 @@ impl AffixDict {
             if r.cond_matches(&root, false) {
                 // A circumfix prefix works only with its suffix, and one that needs another
                 // affix only with a suffix too.
-                taken.push((root, self.cont_holds(r, self.circumfix), self.cont_holds(r, self.need_affix), r.cross, r.flag));
+                // //// Neoffice — with the rule's continuation classes.
+                taken.push((root, self.cont_holds(r, self.circumfix), self.cont_holds(r, self.need_affix), r.cross, r.flag, r.cont));
             }
         }
         taken.sort_unstable();
         let mut plain: Vec<u16> = Vec::new();
         let mut crossed: Vec<u16> = Vec::new();
+        // //// Neoffice — the crossed prefixes with continuation classes: (the prefix's flag, its classes' set id).
+        let mut handing: Vec<(u16, u32)> = Vec::new();
         for group in taken.chunk_by(|a, b| (&a.0, a.1, a.2) == (&b.0, b.1, b.2)) {
             if !steps.spend(group.len() + GROUP_STEPS) {
                 return false;
@@ -2051,12 +2065,18 @@ impl AffixDict {
             let Some((root, circ, needs, ..)) = group.first() else { continue };
             plain.clear();
             crossed.clear();
-            for &(.., cross, flag) in group {
+            handing.clear();
+            // //// Neoffice — a crossed prefix with continuation classes hands them down to the suffix.
+            for &(.., cross, flag, cont) in group {
                 if !circ && !needs {
                     plain.push(flag);
                 }
                 if cross {
                     crossed.push(flag);
+                    // //// Neoffice — what the prefix hands down to a suffix (`handing`).
+                    if cont != 0 {
+                        handing.push((flag, cont));
+                    }
                 }
             }
             plain.sort_unstable();
@@ -2072,7 +2092,10 @@ impl AffixDict {
                     return true;
                 }
             }
-            if !crossed.is_empty() && self.suffixed(root, Some(&FlagProbe::new(&crossed)), *circ, *needs, excluded, steps) {
+            // //// Neoffice — the suffix check knows what the prefixes hand down.
+            if !crossed.is_empty()
+                && self.suffixed(root, Some(&Prefixes { flags: FlagProbe::new(&crossed), handing: &handing }), *circ, *needs, excluded, steps)
+            {
                 return true;
             }
         }
@@ -2127,7 +2150,12 @@ impl AffixDict {
     /// from `re/N` and `s/N`).
     /// `need` holds the flags of all the prefixes that could have been taken off (one walk for
     /// them all: a thousand prefix rules adding nothing cost one walk, not a thousand).
-    fn suffixed(&self, w: &str, need: Option<&FlagProbe>, circ: bool, pfx_needs: bool, excluded: Excluded, steps: &Steps) -> bool {
+    ///
+    /// A suffix whose flag is in the continuation classes of a prefix that fits the stem is licensed
+    /// by that prefix even if the stem lacks it ([`Prefixes::handing`]), as Hunspell does (a unit
+    /// `watt/Um` takes its plural `s` through the no-op prefix `Um 0 0/S.`: `watts`).
+    // //// Neoffice — `need` also carries what the prefixes hand down ([`Prefixes`]).
+    fn suffixed(&self, w: &str, need: Option<&Prefixes>, circ: bool, pfx_needs: bool, excluded: Excluded, steps: &Steps) -> bool {
         // Fits the suffix rule `r`: circumfix alike, and in need of another affix only when a
         // prefix that doesn't is there.
         let fits = |r: &Rule| {
@@ -2161,11 +2189,12 @@ impl AffixDict {
                 let takes = |f: &[u16]| {
                     steps.spend(g.rules.len())
                         && rules().any(|r| {
-                            has(f, r.flag)
-                                && need.is_none_or(|n| {
-                                    let cont = self.set(r.cont);
-                                    steps.scan(f.len() + cont.len()) && (n.meets(f) || n.meets(cont))
-                                })
+                            let cont = self.set(r.cont);
+                            // //// Neoffice — the suffix's flag may come from a prefix that fits this stem: the prefix's own flag is the
+                            // stem's or the suffix's classes', as for any prefix.
+                            (has(f, r.flag)
+                                || need.is_some_and(|n| n.handing.iter().any(|&(p, c)| has(self.set(c), r.flag) && (has(f, p) || has(cont, p)))))
+                                && need.is_none_or(|n| steps.scan(f.len() + cont.len()) && (n.flags.meets(f) || n.flags.meets(cont)))
                                 && (need.is_none() || r.cross)
                                 && fits(r)
                                 && steps.cond(r)
@@ -2199,9 +2228,11 @@ impl AffixDict {
                             && r.cond_matches(&root, true)
                     }) {
                         let cont = self.set(r.cont);
-                        if need.is_some_and(|n| steps.scan(cont.len()) && n.meets(cont)) { met.push(r.flag) } else { flags.push(r.flag) }
+                        // //// Neoffice — `need` is [`Prefixes`] now: its flags are the prefixes'.
+                        if need.is_some_and(|n| steps.scan(cont.len()) && n.flags.meets(cont)) { met.push(r.flag) } else { flags.push(r.flag) }
                     }
-                    for (list, p) in [(&mut flags, need), (&mut met, None)] {
+                    // //// Neoffice — the prefixes' flags, from [`Prefixes`].
+                    for (list, p) in [(&mut flags, need.map(|n| &n.flags)), (&mut met, None)] {
                         list.sort_unstable();
                         list.dedup();
                         if !list.is_empty() && self.form_has_flag(&root, list, INNER_CHAIN, p, excluded, steps) {
@@ -2423,6 +2454,31 @@ impl AffixDict {
                         continue;
                     }
                     out.extend(self.prefixed(r, s));
+                }
+                // //// Neoffice — the suffixes the prefix's continuation classes license on the stem, which the stem itself may not carry
+                // (`watt` + the no-op prefix `Um` + the plural `s`): the checker takes them ([`AffixDict::suffixed`]).
+                if on_stem && r.cont != 0 {
+                    for sr in self.suffixes_with(r.cont).into_iter().filter_map(|i| self.suffixes.get(i as usize)) {
+                        work += 1;
+                        if out.len() >= MAX_FORMS || work > limit {
+                            return (out, work);
+                        }
+                        let (s_circ, s_needs) = (self.cont_holds(sr, self.circumfix), self.cont_holds(sr, self.need_affix));
+                        if has(f, sr.flag)
+                            || !sr.cross
+                            || s_circ != circ
+                            || (needs && s_needs)
+                            || self.cont_holds(sr, self.only_in_compound)
+                            || !sr.cond_matches(stem, true)
+                        {
+                            continue;
+                        }
+                        let Some(base) = stem.strip_suffix(&*sr.strip) else { continue };
+                        if base.is_empty() && !self.full_strip {
+                            continue;
+                        }
+                        out.extend(self.prefixed(r, &format!("{base}{}", sr.add)));
+                    }
                 }
             }
             if out.len() >= MAX_FORMS {
@@ -3713,6 +3769,33 @@ pub(crate) mod tests {
         let outer = d(&rules('Y', 'Y', 'Y', "", "/P"), "foo/A");
         assert!(outer.check("unfooab") && !outer.check("unfooa"), "flag from the outer suffix");
         assert!(!d(&rules('Y', 'Y', 'Y', "", ""), "foo/A").check("unfooab"), "no prefix flag");
+    }
+
+    // //// Neoffice — a prefix's continuation classes license suffixes on the prefixed stem.
+    /// A prefix's continuation classes license suffixes on the prefixed stem, the CLI's answers (French
+    /// units: `watt/Um` and the no-op prefix `PFX Um 0 0/S.` give `watts`, `milliwatts`).
+    #[test]
+    fn a_prefix_hands_down_suffixes_through_its_continuation_classes() {
+        let aff = |p: char, s: char| {
+            format!("SET UTF-8\nPFX U {p} 2\nPFX U 0 0/S .\nPFX U 0 milli/S .\nSFX S {s} 1\nSFX S 0 s .\nSFX T Y 1\nSFX T 0 x .\n")
+        };
+        let d = |aff: &str| AffixDict::from_hunspell(aff, "3\nwatt/U\nfoo\nbar/T\n", &[]).unwrap();
+        let yes = d(&aff('Y', 'Y'));
+        let forms = yes.forms("watt");
+        for w in ["watt", "watts", "milliwatt", "milliwatts"] {
+            assert!(yes.check(w), "{w}");
+            assert!(forms.contains(&w.to_string()), "{w}: {forms:?}");
+        }
+        // The stem has to carry the prefix's flag, and the suffix the right to cross.
+        assert!(!yes.check("foos") && !yes.check("milliwattss") && !yes.check("wattx") && !yes.check("barS"));
+        assert!(!d(&aff('N', 'Y')).check("watts"), "a prefix that doesn't cross hands nothing down");
+        assert!(!d(&aff('Y', 'N')).check("watts"), "a suffix that doesn't cross can't follow a prefix");
+        // Every form listed is accepted, and the compact form keeps the rule.
+        let again = AffixDict::from_bytes(&yes.to_bytes().unwrap()).unwrap();
+        assert!(again.check("watts") && again.check("milliwatts"));
+        for f in yes.forms("watt") {
+            assert!(yes.check(&f), "{f}");
+        }
     }
 
     #[test]
