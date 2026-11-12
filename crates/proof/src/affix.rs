@@ -1718,6 +1718,18 @@ impl AffixDict {
         self.flags.len()
     }
 
+    // //// Neoffice — does the dictionary read a typographic apostrophe as a straight one (`ICONV ’ '`)? Then `l’homme` and `l'homme` are one word.
+    pub(crate) fn reads_typographic_apostrophe(&self) -> bool {
+        self.normalize("\u{2019}") != "\u{2019}"
+    }
+
+    // //// Neoffice — an elision head is a prefix the rules add that ends with an apostrophe.
+    /// Does some prefix rule add exactly `text`? French and Italian dictionaries write their elisions as such prefixes
+    /// (`l'`, `d'`, `qu'`, `dell'`), so this tells an elision head from any other letters before an apostrophe.
+    pub(crate) fn adds_prefix(&self, text: &str) -> bool {
+        self.pfx_index.contains_key(text)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.flags.is_empty()
     }

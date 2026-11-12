@@ -461,7 +461,12 @@ pub(crate) fn load_error(locale: PackLocale) -> Option<String> {
     crate::hunspell::load_error(names(locale).first()?).map(|(_, e)| e)
 }
 
+// //// Neoffice — what only decorates a word (a unit's exponent, an elision before an acronym) is set aside (see `decorated`).
 /// Is `word` right in `locale`? Every word is when there is no dictionary.
+///
+/// A hyphenated word the dictionary doesn't have whole is right when each of its parts is (`est-ce`, `parle-t-il`): the
+/// dictionaries' `BREAK` for the hyphen, which the affix engine doesn't read. A part, or the word, is also right when only
+/// what decorates it is not a word ([`decorated`]).
 pub(crate) fn is_correct(word: &str, locale: PackLocale, opts: &crate::Options) -> bool {
     let (d, _, scripts) = get_with_scripts(locale);
     if d.is_empty() {
@@ -472,10 +477,30 @@ pub(crate) fn is_correct(word: &str, locale: PackLocale, opts: &crate::Options) 
         return true;
     }
     let known = |w: &str| d.check(w) || crate::in_user_dictionary(&w.to_lowercase());
-    if w.contains('-') && !known(w) {
-        return w.split('-').all(|p| p.chars().count() <= 1 || known(p));
+    // //// Neoffice — `part`: a word or one part of a hyphenated one, with what decorates it set aside.
+    let part = |p: &str| known(p) || decorated(&d, p, opts, &known);
+    if w.contains('-') && !part(w) {
+        return w.split('-').all(|p| p.chars().count() <= 1 || part(p));
     }
-    known(w)
+    // //// Neoffice — `part`: the word itself, with what decorates it set aside.
+    part(w)
+}
+
+// //// Neoffice — what only decorates a word (see `is_correct`).
+/// Is `w` right once what only decorates it is set aside: a unit's superscript exponent (`km²`: the unit is the word), or an
+/// elision in front of a word that needs no lookup (`l'OTAN`, `d'IBM`: an acronym or a number, under the options that skip
+/// those) or is the user's own (`d'Apple`)? An elision is a prefix the dictionary's rules add that ends with an apostrophe
+/// (French `l'`, `qu'`, `jusqu'`): other letters before an apostrophe are not one.
+fn decorated(d: &AffixDict, w: &str, opts: &crate::Options, known: &dyn Fn(&str) -> bool) -> bool {
+    let unit = w.trim_end_matches(['²', '³', '¹', '⁰', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁻']);
+    if unit.len() < w.len() && !unit.is_empty() && known(unit) {
+        return true;
+    }
+    let Some((head, tail)) = w.split_once(['\'', '’']) else { return false };
+    if tail.chars().count() < 2 || !(d.adds_prefix(&format!("{head}'")) || d.adds_prefix(&format!("{}'", head.to_lowercase()))) {
+        return false;
+    }
+    crate::in_user_dictionary(&tail.to_lowercase()) || crate::spelling::word_to_check_in(d, tail, opts).is_none()
 }
 
 /// Suggestions for `word` in `locale`, best first, at most `max`.
