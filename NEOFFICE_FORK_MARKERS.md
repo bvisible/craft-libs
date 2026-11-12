@@ -38,6 +38,28 @@ nothing else of this workspace, except upstream's `craft-ai-core`, which `craft-
 its first fifteen seconds. The panel now needs egui 0.37 (it names widgets by their accesskit `Role`). Upstream's files touched:
 `ATTRIBUTION.md` (rows for the fonts, the icons and the sphere) and `Cargo.lock` (the browser crates of the microphone).
 
+## 2026-11-12: `craft-proof` carries French, for builds that read no folder and download nothing
+
+Upstream's French is a Language pack that the app downloads; a build that runs in a browser can neither read a folder nor download. The fork
+changes `crates/proof` so that a program can hand a dictionary over in memory, and brings back the French behaviour the fork had measured
+(`bvisible/wordcraft` embeds Grammalecte 7.7 and registers it at start-up). Everything here is generic (no Neoffice-specific code or text):
+each change is its own commit, marked `//// Neoffice`, and can be proposed upstream as it stands once the marker lines are taken out.
+
+- `embedded.rs` (added file): `embed_dictionary(tag, label, aff, dic, Packing)` registers the `.aff` and `.dic` bytes of a language, plain or raw
+  DEFLATE; nothing is parsed before the first check and the regions of a language (`fr-FR`, `fr-CH`) share one parsed dictionary.
+  `pack_lang.rs` chooses the source: the user's dictionaries folders, then the embedded dictionary, then installed packs and the system's
+  (an unreadable folder file leaves its reason and the embedded one serves); one thread reads a dictionary at a time.
+- `affix.rs`: a prefix's continuation classes license suffixes (`watts`: `watt/Um` and `PFX Um 0 0/S.`); a word in capitals with an apostrophe is the
+  elided form of a capitalized stem (`L'ALLEMAGNE`); a `KEEPCASE` homonym no longer locks the stem's other homonyms (`Bit`, `Bar`, `Pi`); `adds_prefix` and
+  `elisions` read the elisions a dictionary writes as prefixes.
+- `pack_lang.rs`: a unit's exponent (`km²`) and an elision before an acronym or the user's word (`l'OTAN`, `d'Apple`) are not mistakes.
+- `pack_suggest.rs` (added file): suggestions for a pack language with the first letter dearer to change, an elision of a word to correct
+  (`dacord`) and the wrong part of a hyphenated word (`parle-t-ill`).
+- `fr_grammar.rs` (added file) and `lang.rs`/`lib.rs`: French repeated-word and spacing checks with French messages; `fra` and `fre` are French.
+
+Upstream's tests that take `fr-FR` for a language with no dictionary fail on a machine that has a system French dictionary (the engine now reads
+the Mac's `fr-FR`); they pass on CI and with an empty `HOME`.
+
 ## Files that cannot carry a comment
 
 | File | Why it is ours |
