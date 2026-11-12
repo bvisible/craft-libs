@@ -152,6 +152,9 @@ impl ProofLang {
             } else {
                 ProofLang::De
             }
+        // //// Neoffice — the ISO 639-2 codes of French (`fra`, `fre`) are French, as `eng`, `deu` and `spa` are theirs.
+        } else if ["fra", "fre"].iter().any(|c| primary.eq_ignore_ascii_case(c)) {
+            PackLocale::new(&format!("fr{}", tag.get(primary.len()..).unwrap_or(""))).map_or(ProofLang::Other, ProofLang::Pack)
         } else if tag.split_once('@').is_some_and(|(_, m)| m.eq_ignore_ascii_case("latin")) {
             // POSIX `sr_RS@latin`: the Latin-script language (`sr-latn`).
             PackLocale::new(&format!("{primary}-latn")).map_or(ProofLang::Other, ProofLang::Pack)
@@ -560,6 +563,20 @@ mod tests {
             assert_eq!(lang.tag(), lang.pack_locale().map(|l| l.as_str().to_string()).unwrap_or_default(), "{tag}");
         }
         assert_tags(&["x-none", "e", "-", "und", "zxx", "i-klingon"], ProofLang::Other);
+    }
+
+    // //// Neoffice — `fra` and `fre` are French (ISO 639-2), with the region the tag names.
+    #[test]
+    fn the_iso_639_2_codes_of_french_are_french() {
+        for (tag, locale) in
+            [("fra", "fr"), ("fre", "fr"), ("FRA-CH", "fr-ch"), ("fra_CA", "fr-ca"), ("fre-Latn-FR", "fr-latn-fr"), ("fr-BE", "fr-be")]
+        {
+            assert_eq!(ProofLang::from_tag(Some(tag)).pack_locale().map(|l| l.to_string()), Some(locale.to_string()), "{tag}");
+        }
+        // A longer code that starts like them is another language.
+        for tag in ["fran", "frx", "frae"] {
+            assert_eq!(ProofLang::from_tag(Some(tag)).pack_locale().map(|l| l.to_string()), Some(tag.to_string()), "{tag}");
+        }
     }
 
     /// #3360, #3553: Spanish is proofed, by region: Spain (and no region), Mexico, Uruguay, and
