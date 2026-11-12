@@ -2290,9 +2290,25 @@ impl AffixDict {
                 self.contains_except(&capitalize(&lower), keep)
                     || self.contains_in(&lower, keep, true)
                     || self.mixed_case(&lower, keep)
+                    // //// Neoffice — `L'ALLEMAGNE` is the elided form of `Allemagne` (see `after_apostrophe`).
+                    || self.after_apostrophe(&lower, keep)
                     || (self.check_sharps && self.sharps(&lower, excluded))
             }
         }
+    }
+
+    // //// Neoffice — a word in capitals with an apostrophe, as Hunspell reads it (it read it as a plain one, and refused `L'ALLEMAGNE`).
+    /// Is `lower` (a word in capitals with an apostrophe, lowercased: `l'allemagne`) the elided form of a
+    /// word whose stem starts with a capital (`Allemagne`), as Hunspell reads it: the word after the first apostrophe
+    /// capitalized, with the part before it in lower case (`l'Allemagne`) or capitalized (`L'Allemagne`)?
+    fn after_apostrophe(&self, lower: &str, excluded: Excluded) -> bool {
+        let Some((at, apostrophe)) = lower.char_indices().find(|&(_, c)| c == '\'' || c == '\u{2019}') else { return false };
+        let (head, tail) = (lower.get(..at).unwrap_or_default(), lower.get(at + apostrophe.len_utf8()..).unwrap_or_default());
+        if head.is_empty() || tail.is_empty() {
+            return false;
+        }
+        let tail = capitalize(tail);
+        [head.to_string(), capitalize(head)].into_iter().any(|h| self.contains_except(&format!("{h}{apostrophe}{tail}"), excluded))
     }
 
     /// Is `lower` (a word in capitals, lowercased) a stem in mixed case, or one with an ending
@@ -3808,6 +3824,21 @@ pub(crate) mod tests {
         for d in [d, again] {
             assert!(d.check("unstop") && d.check("stops") && d.check("unstopa") && d.check("unstopab") && d.check("ungos"));
             assert!(!d.check("unstops"));
+        }
+    }
+
+    // //// Neoffice — a word in capitals with an apostrophe is the elided form of a capitalized stem.
+    /// The CLI's answers (French `l'` and `d'` before a proper noun): a word in capitals with an apostrophe is the
+    /// elided form of a capitalized stem, `L'ALLEMAGNE` as `L'Allemagne` or `l'Allemagne`, but not of a lower-case one's mistake.
+    #[test]
+    fn a_word_in_capitals_with_an_apostrophe_is_the_elided_form_of_a_proper_noun() {
+        let aff = "SET UTF-8\nICONV 1\nICONV \u{2019} '\nPFX L Y 2\nPFX L 0 l' [aeiouhéAEIOUHÉ]\nPFX L 0 L' [AEIOUHÉ]\nPFX D Y 1\nPFX D 0 d' [aeiouhéAEIOUHÉ]\n";
+        let d = AffixDict::from_hunspell(aff, "4\nAllemagne/LD\nabord/LD\nétat/LD\nhomme/L\n", &[]).unwrap();
+        for w in ["L'ALLEMAGNE", "D'ALLEMAGNE", "L\u{2019}ALLEMAGNE", "l'Allemagne", "L'Allemagne", "L'ÉTAT", "D'ABORD", "L'HOMME", "ALLEMAGNE"] {
+            assert!(d.check(w), "{w}");
+        }
+        for w in ["L'ALLEMAGNEE", "L'ALLEMAGN", "L'allemagne", "l'allemagne", "D'HOMME", "X'ALLEMAGNE", "'ALLEMAGNE", "L'"] {
+            assert!(!d.check(w), "{w}");
         }
     }
 
