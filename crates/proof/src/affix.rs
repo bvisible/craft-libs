@@ -1775,7 +1775,8 @@ impl AffixDict {
     }
 
     /// Flag set of a stem, if `w` is one.
-    fn stem_flags(&self, w: &str) -> Option<&[u16]> {
+    // //// Neoffice — a `Cow`: see `stem_flags_except`.
+    fn stem_flags(&self, w: &str) -> Option<std::borrow::Cow<'_, [u16]>> {
         self.stem_flags_except(w, self.excluded(false))
     }
 
@@ -1783,20 +1784,41 @@ impl AffixDict {
     /// carrying FORBIDDENWORD (listed, not a word) or ONLYINCOMPOUND (a word only inside a
     /// compound, [`Self::compound`]) is no hit, and (this is the only stem lookup outside
     /// compounds) no affixed form is built on it either.
-    fn stem_flags_except(&self, w: &str, excluded: Excluded) -> Option<&[u16]> {
-        self.stem_set(w).filter(|set| !excluded.hits(set) && !self.only_in_compound.is_some_and(|f| has(set, f)))
+    ///
+    // //// Neoffice — homonyms are judged one by one when the merged flags only fail on `KEEPCASE` (upstream refused a case variant of any
+    // stem one of whose homonyms is `KEEPCASE`: French `bit/S.` the word beside `bit/Um--` the unit, so `Bit` and `Bar` were wrong).
+    ///
+    /// When the merged flags of homonyms only fail on `KEEPCASE` (a case variant is being checked), the stem is a word as written
+    /// through the homonyms that lack it, and only their flags count, as in Hunspell (French `bit/S.` the word beside `bit/Um--`
+    /// the unit, which must be written lower case: `Bit`, `Bits` and `BIT` are the word's, `Km` is not `k` + the unit `m`).
+    fn stem_flags_except(&self, w: &str, excluded: Excluded) -> Option<std::borrow::Cow<'_, [u16]>> {
+        let (at, set) = self.stem_lookup(w)?;
+        let usable = |set: &[u16]| !excluded.hits(set) && !self.only_in_compound.is_some_and(|f| has(set, f));
+        if usable(set) {
+            return Some(std::borrow::Cow::Borrowed(set));
+        }
+        let k = excluded.3.filter(|&k| has(set, k))?;
+        let free: Vec<&[u16]> = self.homonyms.get(&at)?.iter().map(|&h| self.set(h)).filter(|h| !has(h, k) && usable(h)).collect();
+        match free.as_slice() {
+            [] => None,
+            [one] => Some(std::borrow::Cow::Borrowed(one)),
+            many => {
+                let mut union: Vec<u16> = many.iter().flat_map(|h| h.iter().copied()).collect();
+                union.sort_unstable();
+                union.dedup();
+                Some(std::borrow::Cow::Owned(union))
+            }
+        }
     }
 
     /// Does one homonym of the stem `w` (excluded ones aside) have flags meeting `pred`?
     fn homonym_meets(&self, w: &str, excluded: Excluded, pred: impl Fn(&[u16]) -> bool) -> bool {
         let Some((at, set)) = self.stem_lookup(w) else { return false };
         let usable = |set: &[u16]| !excluded.hits(set) && !self.only_in_compound.is_some_and(|f| has(set, f));
-        if !usable(set) {
-            return false;
-        }
+        // //// Neoffice — homonyms are judged one by one, as `stem_flags_except` does: the merged flags carry the `KEEPCASE` of any of them.
         match self.homonyms.get(&at) {
             Some(sets) => sets.iter().map(|&h| self.set(h)).any(|h| usable(h) && pred(h)),
-            None => pred(set),
+            None => usable(set) && pred(set),
         }
     }
 
@@ -1853,7 +1875,8 @@ impl AffixDict {
     /// a continuation class on the way (`meg` + `épít` + `és` + `e`).
     fn form_has_flag(&self, w: &str, flags: &[u16], depth: u8, pfx: Option<&FlagProbe>, excluded: Excluded, steps: &Steps) -> bool {
         let fits = |f: &[u16]| steps.scan(f.len()) && intersects(f, flags) && pfx.is_none_or(|p| p.meets(f));
-        if if pfx.is_some() { self.homonym_meets(w, excluded, fits) } else { self.stem_flags_except(w, excluded).is_some_and(fits) } {
+        // //// Neoffice — `stem_flags_except` returns a `Cow`.
+        if if pfx.is_some() { self.homonym_meets(w, excluded, fits) } else { self.stem_flags_except(w, excluded).is_some_and(|f| fits(&f)) } {
             return true;
         }
         // Without continuation classes no rule leads from a form to another.
@@ -2084,7 +2107,8 @@ impl AffixDict {
             crossed.sort_unstable();
             crossed.dedup();
             if !plain.is_empty() {
-                if self.stem_flags_except(root, excluded).is_some_and(|f| steps.scan(f.len()) && intersects(f, &plain)) {
+                // //// Neoffice — `stem_flags_except` returns a `Cow`.
+                if self.stem_flags_except(root, excluded).is_some_and(|f| steps.scan(f.len()) && intersects(&f, &plain)) {
                     return true;
                 }
                 plain.retain(|&f| self.is_cont_flag(f));
@@ -2204,7 +2228,8 @@ impl AffixDict {
                 if if need.is_some() {
                     self.homonym_meets(&root, excluded, takes)
                 } else {
-                    self.stem_flags_except(&root, excluded).is_some_and(takes)
+                    // //// Neoffice — `stem_flags_except` returns a `Cow`.
+                    self.stem_flags_except(&root, excluded).is_some_and(|f| takes(&f))
                 } {
                     return true;
                 }
@@ -2364,7 +2389,8 @@ impl AffixDict {
     pub(crate) fn forms_spending(&self, stem: &str, budget: &mut usize) -> Vec<String> {
         let Some(f) = self.stem_flags(stem) else { return Vec::new() };
         let start = *budget;
-        let out = self.forms_within(stem, f, (*budget).min(MAX_FORMS_WORK));
+        // //// Neoffice — `stem_flags` returns a `Cow`.
+        let out = self.forms_within(stem, &f, (*budget).min(MAX_FORMS_WORK));
         *budget = start.saturating_sub(out.1);
         out.0
     }
@@ -3443,6 +3469,35 @@ pub(crate) mod tests {
         assert!(matches!(d.normalize("fine"), std::borrow::Cow::Borrowed("fine")));
         assert_eq!(d.normalize("(ﬁ)ne"), "fine");
         assert!(matches!(dict().normalize("kot"), std::borrow::Cow::Borrowed("kot")));
+    }
+
+    // //// Neoffice — a stem listed twice, once `KEEPCASE` and once not.
+    /// A stem listed twice, once `KEEPCASE` and once not, is a word in its case variants through the second (the CLI's
+    /// answers: French `bit/S.` the word beside `bit/Um--` the unit).
+    #[test]
+    fn a_keepcase_homonym_does_not_lock_the_others() {
+        let aff = "SET UTF-8\nKEEPCASE k\nSFX S Y 1\nSFX S 0 s .\n";
+        let d = AffixDict::from_hunspell(aff, "3\nbit/S\nbit/k\nkm/k\n", &[]).unwrap();
+        for w in ["bit", "bits", "Bit", "BIT", "Bits", "BITS", "km"] {
+            assert!(d.check(w), "{w}");
+        }
+        for w in ["Km", "KM", "kms", "Kms", "bitt"] {
+            assert!(!d.check(w), "{w}");
+        }
+        // The locked homonym's own affixes stay its own: `m` the unit (`k` + `m`) beside `m` the word.
+        let units =
+            AffixDict::from_hunspell("SET UTF-8\nKEEPCASE k\nPFX K Y 1\nPFX K 0 k .\nSFX S Y 1\nSFX S 0 s .\n", "3\nm/Kk\nm/S\nm/x\n", &[]).unwrap();
+        assert!(units.check("km") && units.check("m") && units.check("ms") && units.check("M") && units.check("Ms"));
+        assert!(!units.check("Km") && !units.check("KM") && !units.check("kms"), "the prefix belongs to the locked homonym");
+        let again = AffixDict::from_bytes(&d.to_bytes().unwrap()).unwrap();
+        assert!(again.check("Bit") && again.check("BITS") && !again.check("Km"));
+        // The prefix and the suffix of a case variant come from the unlocked homonym too (`Rebit`, `Rebits`).
+        let prefixed =
+            AffixDict::from_hunspell("SET UTF-8\nKEEPCASE k\nPFX P Y 1\nPFX P 0 re .\nSFX S Y 1\nSFX S 0 s .\n", "2\nbit/PS\nbit/k\n", &[]).unwrap();
+        for w in ["rebit", "rebits", "Rebit", "Rebits", "REBITS", "Bits"] {
+            assert!(prefixed.check(w), "{w}");
+        }
+        assert!(!prefixed.check("Rebitt"));
     }
 
     #[test]
