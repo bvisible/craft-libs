@@ -84,6 +84,8 @@ pub mod id;
 pub mod it;
 pub mod lang;
 mod pack_lang;
+// //// Neoffice — added: suggestions for a pack language.
+mod pack_suggest;
 pub mod packs;
 pub mod patterns;
 pub mod pl;

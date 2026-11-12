@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::affix::AffixDict;
-use crate::affix_suggest::Tuning;
+// //// Neoffice — suggestions moved to `pack_suggest`, which has the tuning.
 use crate::lang::PackLocale;
 
 /// The memory budget of the loaded dictionaries, in estimated bytes.
@@ -509,7 +509,8 @@ pub(crate) fn suggest(word: &str, max: usize, locale: PackLocale) -> Vec<String>
     if d.is_empty() {
         return Vec::new();
     }
-    crate::affix_suggest::suggest_in(&d, word, max, &Tuning::DEFAULT)
+    // //// Neoffice — the shared ranking with a dearer first letter, elisions of a word to correct, and a hyphenated word's wrong part.
+    crate::pack_suggest::suggest(&d, word, max)
 }
 
 /// The pack locales whose hyphenation patterns serve a [`crate::ProofLang::Pack`] language: the locale,

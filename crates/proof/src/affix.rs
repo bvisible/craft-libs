@@ -1739,6 +1739,22 @@ impl AffixDict {
         self.prefixes.len() + self.suffixes.len()
     }
 
+    // //// Neoffice — the elisions a dictionary writes, for the suggestions of a pack language (`pack_suggest`).
+    /// The elisions the prefix rules write (`l`, `d`, `qu`, `jusqu`): the prefixes they add that are letters and an apostrophe,
+    /// in lower case without it, longest first.
+    pub(crate) fn elisions(&self) -> Vec<String> {
+        let mut heads: Vec<String> = self
+            .pfx_index
+            .keys()
+            .filter_map(|k| k.strip_suffix('\''))
+            .filter(|h| !h.is_empty() && h.chars().all(char::is_alphabetic))
+            .map(str::to_lowercase)
+            .collect();
+        heads.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        heads.dedup();
+        heads
+    }
+
     fn word(&self, i: usize) -> Option<&str> {
         let a = *self.offs.get(i)? as usize;
         let b = *self.offs.get(i + 1)? as usize;
