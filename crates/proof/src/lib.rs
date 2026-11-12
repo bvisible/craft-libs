@@ -77,6 +77,8 @@ pub mod embedded;
 pub mod en_variants;
 mod english;
 pub mod es;
+// //// Neoffice — added: French repeated-word and spacing checks.
+mod fr_grammar;
 pub mod hr;
 pub mod hunspell;
 pub mod hyphen;
@@ -990,6 +992,8 @@ fn grammar_in(text: &str, lang: ProofLang, capital_first: bool) -> Vec<Issue> {
     match lang {
         ProofLang::En => grammar_en(text, capital_first),
         ProofLang::EnGb | ProofLang::EnAu | ProofLang::EnCa => grammar_en(text, capital_first).into_iter().map(|i| Issue { lang, ..i }).collect(),
+        // //// Neoffice — French has repeated-word and spacing checks with French messages (every region: `fr`, `fr-CH`…), when it is proofed.
+        ProofLang::Pack(l) if l.primary() == "fr" && lang.is_proofed() => fr_grammar::check(text, lang),
         // `pt-pt` shares Portuguese's rules, its issues in its own language.
         _ => language(lang.built_in())
             .map_or_else(Vec::new, |l| (l.grammar)(text, lang, capital_first).into_iter().map(|i| Issue { lang, ..i }).collect()),
