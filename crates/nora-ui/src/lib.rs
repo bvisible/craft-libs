@@ -362,6 +362,10 @@ pub struct NoraPanel {
     /// Whether the person may dictate (the microphone), where the browser has one: an app whose server cannot turn
     /// speech into words turns it off. On by default.
     pub dictation: bool,
+    /// The app draws a page of its own where the conversation is empty (`show_with`'s `empty`: a flow of its own over an
+    /// empty session) that a new conversation leaves: New conversation is offered then even though the conversation drawn
+    /// is empty, and says so as ever ([`PanelAction::NewConversation`]). Off (the default): offered once the conversation began.
+    pub new_leaves_page: bool,
     close_requested: bool,
     draft: String,
     focus_input: bool,
@@ -528,7 +532,7 @@ impl NoraPanel {
                     if self.closable && ghost_icon(ui, skin, Icon::Close, &self.pane_words.close, true).clicked() {
                         self.close_requested = true;
                     }
-                    let started = session.thread_id().is_some() || !session.transcript().is_empty();
+                    let started = self.new_leaves_page || session.thread_id().is_some() || !session.transcript().is_empty();
                     if ghost_icon(ui, skin, Icon::NewChat, &self.labels.new_conversation, started).clicked() {
                         actions.push(PanelAction::NewConversation);
                     }
@@ -1815,6 +1819,19 @@ mod tests {
         h.get_by_label("Undo this change").click();
         h.run();
         assert_eq!(h.state().actions, vec![PanelAction::Undo]);
+    }
+
+    /// An app that draws a page of its own in the empty conversation (a flow over an empty session) has New conversation
+    /// offered there, to leave that page: the panel says it was clicked.
+    #[test]
+    fn new_conversation_is_offered_over_a_page_the_app_draws_in_the_empty_conversation() {
+        let mut h = harness(session());
+        h.state_mut().panel.new_leaves_page = true;
+        h.run();
+        assert!(!h.get_by_label("New conversation").accesskit_node().is_disabled());
+        h.get_by_label("New conversation").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![PanelAction::NewConversation]);
     }
 
     #[test]
