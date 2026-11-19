@@ -50,6 +50,10 @@ browser's question included), when the app draws no frame at all for two seconds
 recorder the browser refuses closes the microphone it was given, and a recording that ends hands no late event to a dropped
 callback. Only `crates/nora-ui` changes.
 
+Then, so that an app's tests can prove it gives a dictation up when its pane goes: `NoraPanel::dictation_under_way` says whether
+one is (the microphone open or asked for, or its words on their way), and the feature `test-support` (`NoraPanel::pretend_microphone`,
+for an app's dev-dependencies only) makes the panel offer its microphone outside a browser. Only `crates/nora-ui` changes.
+
 ## 2026-11-12: `craft-proof` carries French, for builds that read no folder and download nothing
 
 Upstream's French is a Language pack that the app downloads; a build that runs in a browser can neither read a folder nor download. The fork

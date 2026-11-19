@@ -154,8 +154,8 @@ pub(crate) struct Voice {
     /// What to tell the person once, in a line under the composer.
     notice: Option<Recorded>,
     recorder: platform::Recorder,
-    /// Whether the pane's tests pretend there is a microphone.
-    #[cfg(test)]
+    /// Whether the pane's tests, or an app's (feature `test-support`), pretend there is a microphone.
+    #[cfg(any(test, feature = "test-support"))]
     pretend: bool,
 }
 
@@ -168,7 +168,7 @@ impl std::fmt::Debug for Voice {
 impl Voice {
     /// Whether this page can record.
     pub fn available(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.pretend {
             return true;
         }
@@ -277,7 +277,7 @@ impl Voice {
         self.notice.take()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pretend_available(&mut self) {
         self.pretend = true;
     }

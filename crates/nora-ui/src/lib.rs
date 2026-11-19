@@ -444,6 +444,21 @@ impl NoraPanel {
         }
     }
 
+    /// Whether a dictation is under way: the microphone open or asked for, or what was said on its way to be written down.
+    /// It is what [`NoraPanel::cancel_dictation`] gives up. A microphone the browser's recorder let go by itself (the page out of
+    /// sight, the panel no longer drawn) is told to the panel when it is drawn again: until then, or until the dictation is given
+    /// up, this still says true.
+    pub fn dictation_under_way(&self) -> bool {
+        !self.voice.settled()
+    }
+
+    /// For an app's tests (feature `test-support`): the panel offers its microphone outside a browser, as a page that has one
+    /// does. A click on it asks for the microphone, which never opens: the dictation is under way until it is given up.
+    #[cfg(feature = "test-support")]
+    pub fn pretend_microphone(&mut self) {
+        self.voice.pretend_available();
+    }
+
     /// Draws the panel and returns what the user did this frame.
     pub fn show(&mut self, ui: &mut Ui, session: &NoraSession) -> Vec<PanelAction> {
         self.show_with(ui, session, None)
@@ -2308,6 +2323,44 @@ mod tests {
         let ctx = h.ctx.clone();
         assert!(h.state_mut().left.voice.look_for_test(&ctx), "the one no longer drawn lets its microphone go");
         assert!(!h.state_mut().kept.voice.look_for_test(&ctx), "the one still drawn keeps its own");
+    }
+
+    /// What an app reads of a dictation: under way from the click on the microphone (the browser still asking), while the person
+    /// speaks and while the words come; no longer once it is given up.
+    #[test]
+    fn an_app_reads_whether_a_dictation_is_under_way() {
+        let mut h = harness(session());
+        h.state_mut().panel.voice.pretend_available();
+        h.run_steps(3);
+        assert!(!h.state().panel.dictation_under_way(), "nothing yet");
+        h.get_by_label("Dictate").click();
+        h.run_steps(2);
+        assert!(h.state().panel.dictation_under_way(), "the microphone asked for");
+        h.state_mut().panel.voice.begin_for_test(0.0);
+        assert!(h.state().panel.dictation_under_way(), "the person speaks");
+        h.state_mut().panel.voice.stop();
+        assert!(h.state().panel.dictation_under_way(), "the words on their way");
+        h.state_mut().panel.cancel_dictation();
+        assert!(!h.state().panel.dictation_under_way(), "given up");
+    }
+
+    /// An app's tests (feature `test-support`) open the microphone of a panel outside a browser as a person does, by its button:
+    /// the dictation is under way until the app gives it up.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn an_app_can_pretend_a_microphone_in_its_tests() {
+        let mut h = harness(session());
+        h.run_steps(3);
+        assert!(h.query_by_label("Dictate").is_none(), "no microphone outside a browser");
+        h.state_mut().panel.pretend_microphone();
+        h.run_steps(2);
+        h.get_by_label("Dictate").click();
+        h.run_steps(2);
+        assert!(h.state().panel.dictation_under_way());
+        h.state_mut().panel.cancel_dictation();
+        h.run_steps(2);
+        assert!(!h.state().panel.dictation_under_way());
+        assert!(h.query_by_label("Dictate").is_some(), "on offer again");
     }
 
     /// Words that were on their way when the dictation was thrown away are written nowhere, even when they come in.

@@ -15,6 +15,9 @@ workspace = true
 # the only way to look at what egui draws without a window. Off by default: it builds wgpu.
 [features]
 preview = ["egui_kittest/wgpu", "dep:image"]
+# //// Neoffice — for an app's tests (a dev-dependency's feature, never a build's): `NoraPanel::pretend_microphone` makes the
+# panel offer its microphone outside a browser, so that a test can check the app gives a dictation up when its pane goes.
+test-support = []
 
 [dependencies]
 craft-nora = { workspace = true }
