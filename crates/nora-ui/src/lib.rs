@@ -434,6 +434,16 @@ impl NoraPanel {
         self.dictation && self.voice.available()
     }
 
+    /// Gives up the dictation under way, if there is one: the recording stops, the microphone is closed and nothing of it is
+    /// kept. For an app whose pane goes away or shows something else: drawn no more, the panel would leave the microphone open.
+    /// The words of a recording already on its way are the session's to drop ([`Input::CancelDictation`]).
+    pub fn cancel_dictation(&mut self) {
+        self.dictate_then_send = false;
+        if !self.voice.settled() {
+            self.voice.cancel();
+        }
+    }
+
     /// Draws the panel and returns what the user did this frame.
     pub fn show(&mut self, ui: &mut Ui, session: &NoraSession) -> Vec<PanelAction> {
         self.show_with(ui, session, None)
@@ -484,10 +494,13 @@ impl NoraPanel {
     /// What the microphone did since the last frame: a recording that is over goes to the server as a dictation; one that
     /// came to nothing, or could not be made, is said once, under the composer.
     fn poll_voice(&mut self, now: f64, actions: &mut Vec<PanelAction>) {
-        if let Some(recorded) = self.voice.poll(now)
-            && let voice::Recorded::Audio { bytes, mime } = recorded
-        {
-            actions.push(PanelAction::Dictate { audio_base64: craft_nora::protocol::base64(&bytes), mime });
+        match self.voice.poll(now) {
+            Some(voice::Recorded::Audio { bytes, mime }) => {
+                actions.push(PanelAction::Dictate { audio_base64: craft_nora::protocol::base64(&bytes), mime });
+            }
+            // No words will come: the send arrow pressed while listening has nothing to send (what was typed stays to be read).
+            Some(_) => self.dictate_then_send = false,
+            None => {}
         }
         if let Some(said) = self.voice.take_notice() {
             self.voice_notice = Some((said, now));
@@ -512,7 +525,13 @@ impl NoraPanel {
             self.draft.push_str(words);
             self.focus_input = true;
         } else {
-            self.voice.say_nothing_heard();
+            self.dictate_then_send = false;
+            // A server that failed heard no silence: the person is told it did not work, not to speak closer.
+            if done.error.is_some() {
+                self.voice.say_failed();
+            } else {
+                self.voice.say_nothing_heard();
+            }
         }
     }
 
@@ -534,6 +553,8 @@ impl NoraPanel {
                     }
                     let started = self.new_leaves_page || session.thread_id().is_some() || !session.transcript().is_empty();
                     if ghost_icon(ui, skin, Icon::NewChat, &self.labels.new_conversation, started).clicked() {
+                        // A new conversation forgets the calls under way, a recording's too: no words would ever come.
+                        self.cancel_dictation();
                         actions.push(PanelAction::NewConversation);
                     }
                 });
@@ -1259,7 +1280,7 @@ pub fn drive(ctx: &Context, session: &mut NoraSession) -> Vec<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use craft_nora::{AppKind, DocumentInfo, HttpResponse, PageContext, SessionConfig};
+    use craft_nora::{AppKind, DocumentInfo, HttpRequest, HttpResponse, PageContext, SessionConfig};
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::{Value, json};
@@ -2137,6 +2158,132 @@ mod tests {
         }));
         let done = nora.dictation().expect("answered");
         assert_eq!((done.text.as_deref(), done.error.as_deref()), (None, Some("Empty audio")));
+    }
+
+    /// A session with a recording on its way to the server, and the call that carries it.
+    fn transcribing() -> (NoraSession, HttpRequest) {
+        let mut nora = session();
+        let sent = nora.handle(Input::Transcribe { audio_base64: "AAAA".into(), mime: "audio/webm".into() });
+        let request = sent.iter().find_map(|output| if let Output::Http(request) = output { Some(request.clone()) } else { None }).expect("a call");
+        (nora, request)
+    }
+
+    /// The pane goes away while the person speaks (the app closes it, or shows something else): the microphone is closed, nothing
+    /// is kept, and the send arrow they may have pressed sends nothing afterwards.
+    #[test]
+    fn an_app_can_let_go_of_the_microphone() {
+        let mut h = harness(session());
+        h.state_mut().panel.voice.pretend_available();
+        h.state_mut().panel.set_draft("Bonjour");
+        h.run_steps(3);
+        h.get_by_label("Dictate").click();
+        h.run_steps(2);
+        h.state_mut().panel.voice.begin_for_test(0.0);
+        h.state_mut().panel.dictate_then_send = true;
+        h.state_mut().panel.cancel_dictation();
+        h.run_steps(3);
+        assert!(h.state().panel.voice.settled(), "the microphone is closed");
+        assert!(!h.state().actions.iter().any(|action| matches!(action, PanelAction::Dictate { .. } | PanelAction::Send(_))), "nothing leaves");
+        assert_eq!(h.state().panel.draft(), "Bonjour", "what was typed stays");
+        assert!(h.query_by_label("Dictate").is_some(), "the microphone is on offer again");
+    }
+
+    /// Words that were on their way when the dictation was thrown away are written nowhere, even when they come in.
+    #[test]
+    fn the_words_of_a_dictation_thrown_away_are_not_written() {
+        let (nora, request) = transcribing();
+        let mut h = harness(nora);
+        h.state_mut().panel.voice.pretend_available();
+        h.state_mut().panel.voice.begin_for_test(0.0);
+        h.state_mut().panel.voice.stop();
+        h.state_mut().panel.voice.inject(voice::Recorded::Audio { bytes: vec![1], mime: "audio/webm".into() });
+        h.run_steps(2);
+        assert!(h.state().panel.voice.transcribing());
+        h.state_mut().panel.cancel_dictation();
+        h.state_mut().session.handle(Input::CancelDictation);
+        assert!(!h.state().session.dictating());
+        let body = json!({ "message": { "success": true, "text": "dites à personne" } }).to_string();
+        h.state_mut().session.handle(Input::Http(HttpResponse { id: request.id, status: 200, body }));
+        h.run_steps(3);
+        assert_eq!(h.state().panel.draft(), "");
+        assert!(h.state().panel.voice_notice.is_none(), "and nothing is said: the person left");
+    }
+
+    /// Words already in when the dictation is thrown away (no frame has read them yet) are thrown away with it.
+    #[test]
+    fn words_not_yet_read_go_with_the_dictation_thrown_away() {
+        let (mut nora, request) = transcribing();
+        let body = json!({ "message": { "success": true, "text": "trop tard" } }).to_string();
+        nora.handle(Input::Http(HttpResponse { id: request.id, status: 200, body }));
+        assert!(nora.dictation().is_some());
+        nora.handle(Input::CancelDictation);
+        assert!(nora.dictation().is_none());
+    }
+
+    /// New conversation forgets the calls under way: the pane must not wait for the words for ever.
+    #[test]
+    fn a_new_conversation_leaves_no_dictation_waiting() {
+        let (mut nora, _request) = transcribing();
+        let sent = nora.handle(Input::Send("Hello".into()));
+        answer(&mut nora, &sent[0], json!({ "thread_id": "t1" }));
+        nora.handle(Input::Cancel);
+        let mut h = harness(nora);
+        h.state_mut().panel.voice.pretend_available();
+        h.state_mut().panel.voice.begin_for_test(0.0);
+        h.state_mut().panel.voice.stop();
+        h.state_mut().panel.voice.inject(voice::Recorded::Audio { bytes: vec![1], mime: "audio/webm".into() });
+        h.run_steps(2);
+        assert!(h.state().panel.voice.transcribing());
+        h.get_by_label("New conversation").click();
+        h.run_steps(2);
+        assert!(h.state().actions.contains(&PanelAction::NewConversation));
+        assert!(h.state().panel.voice.settled(), "the box is back");
+    }
+
+    /// A server that failed did not hear silence: the pane says the dictation did not work, and what was typed is not sent by the
+    /// send arrow pressed while listening.
+    #[test]
+    fn a_failed_transcription_is_no_silence_and_sends_nothing() {
+        for (status, body, failed) in [
+            (200, json!({ "message": { "success": false, "error": "Failed to transcribe audio" } }), true),
+            (500, json!({ "exception": "boom" }), true),
+            (0, json!({ "exception": "offline" }), true),
+            (200, json!({ "message": { "success": true, "text": "Sous-titrage Société Radio-Canada" } }), false),
+        ] {
+            let (nora, request) = transcribing();
+            let mut h = harness(nora);
+            h.state_mut().panel.voice.pretend_available();
+            h.state_mut().panel.set_draft("Bonjour");
+            h.state_mut().panel.voice.begin_for_test(0.0);
+            h.state_mut().panel.voice.stop();
+            h.state_mut().panel.dictate_then_send = true;
+            h.state_mut().panel.voice.inject(voice::Recorded::Audio { bytes: vec![1], mime: "audio/webm".into() });
+            h.run_steps(2);
+            h.state_mut().session.handle(Input::Http(HttpResponse { id: request.id, status, body: body.to_string() }));
+            h.run_steps(3);
+            let said = if failed {
+                "The dictation did not work. Try again, or type your request."
+            } else {
+                "I did not hear anything. Try again, a little closer to the microphone."
+            };
+            assert!(h.query_by_label(said).is_some(), "{body}");
+            assert!(h.state().panel.voice.settled(), "{body}");
+            assert!(!h.state().actions.iter().any(|action| matches!(action, PanelAction::Send(_))), "{body}");
+            assert_eq!(h.state().panel.draft(), "Bonjour", "{body}");
+        }
+    }
+
+    /// The page went out of sight while the person spoke: the microphone was let go, nothing is kept, nothing is said.
+    #[test]
+    fn a_page_out_of_sight_ends_the_recording_quietly() {
+        let mut h = harness(session());
+        h.state_mut().panel.voice.pretend_available();
+        h.state_mut().panel.voice.begin_for_test(0.0);
+        h.state_mut().panel.voice.inject(voice::Recorded::Away);
+        h.run_steps(3);
+        assert!(h.state().panel.voice.settled());
+        assert!(h.state().panel.voice_notice.is_none());
+        assert!(h.state().actions.is_empty());
     }
 
     #[test]

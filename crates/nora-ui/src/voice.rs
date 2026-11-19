@@ -3,7 +3,10 @@
 //! Dictation. The person clicks the microphone, speaks, clicks again: what was said is recorded by the browser
 //! (`getUserMedia` and `MediaRecorder`, where the page has them) and handed to the pane as a [`Recorded`] to be turned
 //! into words by the server ([`crate::PanelAction::Dictate`], then `NoraSession::dictation`). Nothing leaves the page
-//! until the person stopped the recording, and the microphone is closed the moment they do.
+//! until the recording is stopped, by the person or at its time limit, and the microphone is closed at that moment. A recording
+//! the browser ended by itself (the device gone, the permission taken back) is not sent. A page that goes out of sight (another
+//! tab, a minimised window, a frame its page hides) may draw no more frames, so nothing drawn could stop in time: the microphone
+//! is let go at once and the recording dropped, unsent.
 //!
 //! The recorder is the browser's; outside a browser (the desktop build, the tests) there is none, and the pane offers no
 //! microphone. The level of the voice (an `AnalyserNode`) moves the bars the pane draws while it listens.
@@ -58,6 +61,8 @@ pub(crate) enum Recorded {
     Missing,
     /// Anything else that went wrong.
     Failed,
+    /// The page went out of sight: the microphone was let go, nothing is kept, and there is nothing to say.
+    Away,
 }
 
 /// The longest recording: past it the browser's recorder is stopped for the person (a request, not a meeting).
@@ -176,7 +181,9 @@ impl Voice {
             Recorded::Audio { .. } => self.phase = Phase::Transcribing,
             other => {
                 self.phase = Phase::Idle;
-                self.notice = Some(other.clone());
+                if other != Recorded::Away {
+                    self.notice = Some(other.clone());
+                }
                 return Some(other);
             }
         }
@@ -193,6 +200,11 @@ impl Voice {
     /// The server heard nothing in what was sent.
     pub fn say_nothing_heard(&mut self) {
         self.notice = Some(Recorded::Nothing);
+    }
+
+    /// The server could not write the recording down.
+    pub fn say_failed(&mut self) {
+        self.notice = Some(Recorded::Failed);
     }
 
     /// The line to show once under the composer, if there is one.
@@ -272,6 +284,11 @@ mod platform {
 
     /// The types the browsers record, best first: Chrome and Firefox speak webm/ogg opus, Safari mp4.
     const TYPES: [&str; 4] = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+    /// The event of a page that goes out of sight or comes back.
+    const VISIBILITY: &str = "visibilitychange";
+    /// How often an open microphone looks whether its frame is still shown, in milliseconds: a frame the page around it hides
+    /// (`display: none`, as the desk does with a page it leaves) is told nothing.
+    const WATCH_MS: i32 = 1_000;
 
     pub(super) fn available() -> bool {
         let Some(window) = web_sys::window() else { return false };
@@ -304,6 +321,9 @@ mod platform {
         /// The closures the browser calls back, kept alive with the recording.
         keep: Vec<Closure<dyn FnMut(BlobEvent)>>,
         keep_stop: Vec<Closure<dyn FnMut()>>,
+        /// What listens for the page going out of sight, while the microphone is open, and the timer that looks at the frame.
+        watch: Option<js_sys::Function>,
+        watch_timer: Option<i32>,
         /// A run of this recorder: an older one's late callbacks do nothing.
         epoch: u64,
         repaint: Option<egui::Context>,
@@ -318,14 +338,35 @@ mod platform {
         Reflect::get(error, &JsValue::from_str("name")).ok().and_then(|name| name.as_string()).unwrap_or_default()
     }
 
+    fn document() -> Option<web_sys::Document> {
+        web_sys::window()?.document()
+    }
+
+    /// Whether the page is out of sight, or the frame it is in has no place in the page around it: it may draw no frames then.
+    fn out_of_sight() -> bool {
+        let hidden_frame =
+            || web_sys::window().and_then(|window| window.frame_element().ok().flatten()).is_some_and(|frame| frame.get_client_rects().length() == 0);
+        document().is_some_and(|page| page.hidden()) || hidden_frame()
+    }
+
+    fn stop_tracks(stream: &MediaStream) {
+        let tracks = stream.get_tracks();
+        for index in 0..tracks.length() {
+            if let Ok(track) = tracks.get(index).dyn_into::<web_sys::MediaStreamTrack>() {
+                track.stop();
+            }
+        }
+    }
+
     fn release(shared: &mut Shared) {
         if let Some(stream) = shared.stream.take() {
-            let tracks = stream.get_tracks();
-            for index in 0..tracks.length() {
-                if let Ok(track) = tracks.get(index).dyn_into::<web_sys::MediaStreamTrack>() {
-                    track.stop();
-                }
-            }
+            stop_tracks(&stream);
+        }
+        if let (Some(watch), Some(page)) = (shared.watch.take(), document()) {
+            let _ = page.remove_event_listener_with_callback(VISIBILITY, &watch);
+        }
+        if let (Some(timer), Some(window)) = (shared.watch_timer.take(), web_sys::window()) {
+            window.clear_interval_with_handle(timer);
         }
         if let Some(audio) = shared.audio.take() {
             let _ = audio.close();
@@ -438,12 +479,13 @@ mod platform {
             }
         };
         if shared.borrow().epoch != epoch || shared.borrow().cancelled {
-            for index in 0..stream.get_tracks().length() {
-                if let Ok(track) = stream.get_tracks().get(index).dyn_into::<web_sys::MediaStreamTrack>() {
-                    track.stop();
-                }
-            }
+            stop_tracks(&stream);
             return Ok(());
+        }
+        // Granted while the page was out of sight (the person answered from elsewhere): nothing is recorded unseen.
+        if out_of_sight() {
+            stop_tracks(&stream);
+            return Err(Recorded::Away);
         }
         let mime = TYPES.iter().find(|candidate| MediaRecorder::is_type_supported(candidate)).copied().unwrap_or("");
         let options = MediaRecorderOptions::new();
@@ -481,18 +523,25 @@ mod platform {
         let on_stop = {
             let shared = shared.clone();
             Closure::<dyn FnMut()>::new(move || {
-                let (chunks, mime, cancelled, current) = {
+                let (chunks, mime) = {
                     let mut state = shared.borrow_mut();
-                    let current = state.epoch == epoch;
-                    let mime = state.mime.clone();
-                    let chunks = std::mem::take(&mut state.chunks);
-                    let cancelled = state.cancelled;
+                    // The late stop of a recording given up: what runs now is another's, and stays open.
+                    if state.epoch != epoch || state.cancelled {
+                        return;
+                    }
                     release(&mut state);
-                    (chunks, mime, cancelled, current)
+                    let chunks = std::mem::take(&mut state.chunks);
+                    // Nobody asked for this stop: the browser ended the recording (the device went, the permission was taken
+                    // back). What it holds was not meant to leave yet.
+                    if state.stopped_at.is_none() {
+                        state.result = Some(Recorded::Failed);
+                        if let Some(ctx) = &state.repaint {
+                            ctx.request_repaint();
+                        }
+                        return;
+                    }
+                    (chunks, state.mime.clone())
                 };
-                if !current || cancelled {
-                    return;
-                }
                 let shared = shared.clone();
                 spawn_local(async move {
                     let parts = Array::new();
@@ -520,12 +569,42 @@ mod platform {
                 });
             })
         };
+        // Out of sight, the page may draw no frame that could stop the recording or reach its time limit: the microphone is let go
+        // here, at once, and what was said is dropped.
+        let on_hidden = {
+            let shared = shared.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                if !out_of_sight() {
+                    return;
+                }
+                let mut state = shared.borrow_mut();
+                if state.epoch != epoch {
+                    return;
+                }
+                state.epoch += 1;
+                state.cancelled = true;
+                release(&mut state);
+                state.result = Some(Recorded::Away);
+                if let Some(ctx) = &state.repaint {
+                    ctx.request_repaint();
+                }
+            })
+        };
+        let watch: js_sys::Function = on_hidden.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        if let Some(page) = document() {
+            let _ = page.add_event_listener_with_callback(VISIBILITY, &watch);
+        }
+        let watch_timer = window.set_interval_with_callback_and_timeout_and_arguments_0(&watch, WATCH_MS).ok();
         recorder.set_ondataavailable(Some(on_data.as_ref().unchecked_ref()));
         recorder.set_onstop(Some(on_stop.as_ref().unchecked_ref()));
         {
             let mut state = shared.borrow_mut();
             state.keep.push(on_data);
             state.keep_stop.push(on_stop);
+            // Kept with the others: it may be running when the recording ends.
+            state.keep_stop.push(on_hidden);
+            state.watch = Some(watch);
+            state.watch_timer = watch_timer;
             state.mime = if mime.is_empty() { recorder.mime_type() } else { mime.to_string() };
             state.stream = Some(stream);
             state.audio = audio;

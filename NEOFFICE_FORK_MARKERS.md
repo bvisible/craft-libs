@@ -38,6 +38,12 @@ nothing else of this workspace, except upstream's `craft-ai-core`, which `craft-
 its first fifteen seconds. The panel now needs egui 0.37 (it names widgets by their accesskit `Role`). Upstream's files touched:
 `ATTRIBUTION.md` (rows for the fonts, the icons and the sphere) and `Cargo.lock` (the browser crates of the microphone).
 
+## 2026-11-19: the microphone is let go when the pane goes away
+
+An app whose pane closes or shows something else gives up the dictation (`NoraPanel::cancel_dictation`, `Input::CancelDictation`:
+its words are forgotten). The recorder lets the microphone go by itself when the page goes out of sight or its frame is hidden, a
+recording the browser ended is not sent, and a transcription that failed is said as such, not as silence. Only our two crates change.
+
 ## 2026-11-12: `craft-proof` carries French, for builds that read no folder and download nothing
 
 Upstream's French is a Language pack that the app downloads; a build that runs in a browser can neither read a folder nor download. The fork

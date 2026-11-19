@@ -141,6 +141,9 @@ pub enum Input {
     /// The person dictated a request: the recording (base64) and its type, to be turned into words
     /// ([`NoraSession::dictation`]). It is not a message: nothing is sent to Nora until the person sends the words.
     Transcribe { audio_base64: String, mime: String },
+    /// The dictation is given up (the pane it was for went away): the words on their way, or come and not yet read, are
+    /// dropped, and [`NoraSession::dictation`] says nothing of them.
+    CancelDictation,
 }
 
 /// What a session asks of the host.
@@ -395,6 +398,10 @@ impl NoraSession {
             Input::AnswerCard { token, approve } => self.on_answer_card(&token, approve, &mut out),
             Input::ChooseOnCard { token, choice } => self.on_choose_on_card(&token, &choice, &mut out),
             Input::Transcribe { audio_base64, mime } => self.on_transcribe(&audio_base64, &mime, &mut out),
+            Input::CancelDictation => {
+                self.inflight.retain(|_, pending| !matches!(pending, Pending::Transcription));
+                self.dictation = None;
+            }
         }
         out
     }
