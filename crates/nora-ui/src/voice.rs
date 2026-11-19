@@ -6,7 +6,9 @@
 //! until the recording is stopped, by the person or at its time limit, and the microphone is closed at that moment. A recording
 //! the browser ended by itself (the device gone, the permission taken back) is not sent. A page that goes out of sight (another
 //! tab, a minimised window, a frame its page hides) may draw no more frames, so nothing drawn could stop in time: the microphone
-//! is let go at once and the recording dropped, unsent.
+//! is let go at once and the recording dropped, unsent. So it is when the page is left (`pagehide`), and when the app no longer
+//! draws the panel while its page is in sight (its pane closed, something else shown in its place): a panel that is not drawn
+//! can neither show that it listens nor be stopped ([`Sight`]).
 //!
 //! The recorder is the browser's; outside a browser (the desktop build, the tests) there is none, and the pane offers no
 //! microphone. The level of the voice (an `AnalyserNode`) moves the bars the pane draws while it listens.
@@ -61,7 +63,8 @@ pub(crate) enum Recorded {
     Missing,
     /// Anything else that went wrong.
     Failed,
-    /// The page went out of sight: the microphone was let go, nothing is kept, and there is nothing to say.
+    /// The microphone was let go, nothing is kept, and there is nothing to say: the page went out of sight or was left, or the
+    /// app no longer drew the panel ([`Sight`]).
     Away,
 }
 
@@ -71,6 +74,63 @@ const MAX_SECONDS: f64 = 120.0;
 /// words nobody said.
 const MIN_SECONDS: f64 = 0.6;
 const QUIET: f32 = 0.02;
+
+/// Looks in a row at which the app drew no frame at all, though the watch asks for one at each of its looks, before an open
+/// microphone is let go: an app that draws nothing shows nothing (it stopped, or the browser paints its frame no more, as
+/// Chrome does with a frame of another origin scrolled out of view, whose page is not hidden for all that). While the browser
+/// still asks for the microphone nothing is open, and they don't count ([`Sight::look_asking`]).
+const IDLE_LOOKS: u32 = 4;
+
+/// What the watch over the microphone knows of the frames the app drew, from the click that asked for it. A panel the app no
+/// longer draws (its pane closed, something else shown in its place, the panel hidden in its `Ui`) can't show that it listens,
+/// nor be stopped, nor reach its time limit: the watch then lets the microphone go. The frames are counted in egui's passes
+/// (`Context::cumulative_pass_nr`): the panel notes each pass it is drawn in where it can be seen, and the watch, between
+/// frames, looks whether the passes that ran since its last look drew it. A look at which no pass ran says nothing of the
+/// panel (a frame may be on its way): only [`IDLE_LOOKS`] of them in a row do.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(all(not(target_arch = "wasm32"), not(test)), allow(dead_code))]
+struct Sight {
+    /// The app's count of passes at the last look: the passes from this one on are not looked at yet.
+    looked_at: u64,
+    /// The last pass the panel was drawn in.
+    drawn_in: u64,
+    /// The looks in a row at which no pass had run at all.
+    idle: u32,
+}
+
+#[cfg_attr(all(not(target_arch = "wasm32"), not(test)), allow(dead_code))]
+impl Sight {
+    /// The watch of a recording asked for in `pass` (the panel was drawn in it: its microphone button was clicked).
+    fn new(pass: u64) -> Self {
+        Sight { looked_at: pass.saturating_add(1), drawn_in: pass, idle: 0 }
+    }
+
+    /// The panel is drawn in `pass`.
+    fn drawn(&mut self, pass: u64) {
+        self.drawn_in = self.drawn_in.max(pass);
+    }
+
+    /// A look of the watch, the app's count of passes being `passes`: whether the microphone is to be let go.
+    fn look(&mut self, passes: u64) -> bool {
+        // The passes from `looked_at` to `passes - 1` ran since the last look; the panel was in one of them if it was drawn in
+        // `looked_at` or later.
+        let ran = passes > self.looked_at;
+        let unseen = ran && self.drawn_in < self.looked_at;
+        self.idle = if ran { 0 } else { self.idle.saturating_add(1) };
+        self.looked_at = self.looked_at.max(passes);
+        unseen || self.idle >= IDLE_LOOKS
+    }
+
+    /// A look made while the browser still asks for the microphone, or as it hands it over: whether the panel was left out of the
+    /// passes that ran since the last look. Nothing is open yet that frames drawn no more could leave unseen (a browser may stop
+    /// drawing behind its question), so the looks without a pass are not counted, and their count starts again.
+    fn look_asking(&mut self, passes: u64) -> bool {
+        let unseen = passes > self.looked_at && self.drawn_in < self.looked_at;
+        self.idle = 0;
+        self.looked_at = self.looked_at.max(passes);
+        unseen
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum Phase {
@@ -165,6 +225,11 @@ impl Voice {
         }
     }
 
+    /// The panel is drawn in this pass of the app (`ctx`'s): while it is, the microphone it shows may stay open ([`Sight`]).
+    pub fn drawn(&mut self, ctx: &egui::Context) {
+        self.recorder.drawn(ctx);
+    }
+
     /// Looks at what the browser did since the last frame: the recording began (or was refused), or it is over. The
     /// recording that is over is returned once.
     pub fn poll(&mut self, now: f64) -> Option<Recorded> {
@@ -227,17 +292,27 @@ impl Voice {
     pub fn begin_for_test(&mut self, now: f64) {
         self.phase = Phase::Listening { since: now };
     }
+
+    /// A look of the watch over the microphone, as the browser's makes between frames: whether it lets the microphone go.
+    #[cfg(test)]
+    pub fn look_for_test(&mut self, ctx: &egui::Context) -> bool {
+        self.recorder.look(ctx.cumulative_pass_nr())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod platform {
     use super::Recorded;
+    #[cfg(test)]
+    use super::Sight;
 
-    /// No recorder outside a browser; the tests may hand it a recording.
+    /// No recorder outside a browser; the tests may hand it a recording, and look as the browser's watch does.
     #[derive(Default)]
     pub(super) struct Recorder {
         #[cfg(test)]
         ready: Option<Recorded>,
+        #[cfg(test)]
+        sight: Sight,
     }
 
     pub(super) fn available() -> bool {
@@ -245,7 +320,27 @@ mod platform {
     }
 
     impl Recorder {
-        pub fn start(&mut self, _ctx: &egui::Context) {}
+        pub fn start(&mut self, ctx: &egui::Context) {
+            #[cfg(test)]
+            {
+                self.sight = Sight::new(ctx.cumulative_pass_nr());
+            }
+            let _ = ctx;
+        }
+        pub fn drawn(&mut self, ctx: &egui::Context) {
+            #[cfg(test)]
+            self.sight.drawn(ctx.cumulative_pass_nr());
+            let _ = ctx;
+        }
+        /// A look of the watch: one that lets the microphone go leaves what the browser's leaves, a recording dropped.
+        #[cfg(test)]
+        pub fn look(&mut self, passes: u64) -> bool {
+            let unseen = self.sight.look(passes);
+            if unseen {
+                self.ready = Some(Recorded::Away);
+            }
+            unseen
+        }
         pub fn stop(&mut self) {}
         pub fn cancel(&mut self) {}
         pub fn level(&self) -> f32 {
@@ -280,15 +375,19 @@ mod platform {
     use wasm_bindgen_futures::{JsFuture, spawn_local};
     use web_sys::{AnalyserNode, AudioContext, Blob, BlobEvent, MediaRecorder, MediaRecorderOptions, MediaStream, MediaStreamConstraints};
 
-    use super::Recorded;
+    use super::{Recorded, Sight};
 
     /// The types the browsers record, best first: Chrome and Firefox speak webm/ogg opus, Safari mp4.
     const TYPES: [&str; 4] = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
     /// The event of a page that goes out of sight or comes back.
     const VISIBILITY: &str = "visibilitychange";
-    /// How often an open microphone looks whether its frame is still shown, in milliseconds: a frame the page around it hides
-    /// (`display: none`, as the desk does with a page it leaves) is told nothing.
-    const WATCH_MS: i32 = 1_000;
+    /// The event of a page that is left (closed, reloaded, navigated away from, or put in the browser's back-forward cache). Not
+    /// `beforeunload`: a page may answer it by keeping the person (an editor with unsaved work asks), who then stays.
+    const LEAVE: &str = "pagehide";
+    /// How often the watch of a recording, from the click on, looks whether the panel is still drawn and its frame still shown,
+    /// in milliseconds: a frame the page around it hides (`display: none`, as the desk does with a page it leaves) is told
+    /// nothing, nor is a panel its app stopped drawing.
+    const WATCH_MS: i32 = 500;
 
     pub(super) fn available() -> bool {
         let Some(window) = web_sys::window() else { return false };
@@ -321,9 +420,14 @@ mod platform {
         /// The closures the browser calls back, kept alive with the recording.
         keep: Vec<Closure<dyn FnMut(BlobEvent)>>,
         keep_stop: Vec<Closure<dyn FnMut()>>,
-        /// What listens for the page going out of sight, while the microphone is open, and the timer that looks at the frame.
+        /// What listens for the page going out of sight and for the page being left, while the microphone is open, and the
+        /// timer that looks at the frame and at the panel, from the click on ([`watch`]).
         watch: Option<js_sys::Function>,
+        leave: Option<js_sys::Function>,
         watch_timer: Option<i32>,
+        /// The passes the panel was drawn in, as the watch knows them, and the app's viewport they are counted in.
+        sight: Sight,
+        viewport: egui::ViewportId,
         /// A run of this recorder: an older one's late callbacks do nothing.
         epoch: u64,
         repaint: Option<egui::Context>,
@@ -365,6 +469,9 @@ mod platform {
         if let (Some(watch), Some(page)) = (shared.watch.take(), document()) {
             let _ = page.remove_event_listener_with_callback(VISIBILITY, &watch);
         }
+        if let (Some(leave), Some(window)) = (shared.leave.take(), web_sys::window()) {
+            let _ = window.remove_event_listener_with_callback(LEAVE, &leave);
+        }
         if let (Some(timer), Some(window)) = (shared.watch_timer.take(), web_sys::window()) {
             window.clear_interval_with_handle(timer);
         }
@@ -372,8 +479,72 @@ mod platform {
             let _ = audio.close();
         }
         shared.analyser = None;
-        shared.recorder = None;
+        // Its late events (the last data, the stop of a recording given up) reach nothing: their closures go at the next start.
+        if let Some(recorder) = shared.recorder.take() {
+            recorder.set_ondataavailable(None);
+            recorder.set_onstop(None);
+        }
         shared.listening = false;
+    }
+
+    /// The app's count of passes in the viewport the panel is drawn in.
+    fn passes(shared: &Shared) -> u64 {
+        shared.repaint.as_ref().map_or(0, |ctx| ctx.cumulative_pass_nr_for(shared.viewport))
+    }
+
+    /// The watch of run `epoch`, from the click on, between frames: the frame hidden by the page around it, or the panel no
+    /// longer drawn by its app ([`Sight`]). Each look asks for a frame, so that an app with nothing else to draw draws one the
+    /// next look can count. While the browser still asks for the microphone (no stream yet), only a panel left out of the
+    /// passes lets the request go: the page out of sight then (the person answering from another tab) is looked at when the
+    /// browser hands the microphone over. It stops with the run ([`release`]).
+    fn watch(shared: &Rc<RefCell<Shared>>, epoch: u64) {
+        let Some(window) = web_sys::window() else { return };
+        let on_watch = {
+            let shared = shared.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                let (unseen, asking) = {
+                    let Ok(mut state) = shared.try_borrow_mut() else { return };
+                    if state.epoch != epoch {
+                        return;
+                    }
+                    let passes = passes(&state);
+                    let asking = state.stream.is_none();
+                    let unseen = if asking { state.sight.look_asking(passes) } else { state.sight.look(passes) };
+                    if let Some(ctx) = &state.repaint {
+                        ctx.request_repaint();
+                    }
+                    (unseen, asking)
+                };
+                if unseen || (!asking && out_of_sight()) {
+                    let_go(&shared, epoch);
+                }
+            })
+        };
+        let timer = window.set_interval_with_callback_and_timeout_and_arguments_0(on_watch.as_ref().unchecked_ref(), WATCH_MS).ok();
+        let Ok(mut state) = shared.try_borrow_mut() else {
+            if let Some(timer) = timer {
+                window.clear_interval_with_handle(timer);
+            }
+            return;
+        };
+        state.watch_timer = timer;
+        // Kept with the run's other callbacks: it may be running when the run ends.
+        state.keep_stop.push(on_watch);
+    }
+
+    /// Lets the microphone of run `epoch` go, at once, and drops what was said: nothing drawn could stop it in time.
+    fn let_go(shared: &Rc<RefCell<Shared>>, epoch: u64) {
+        let Ok(mut state) = shared.try_borrow_mut() else { return };
+        if state.epoch != epoch {
+            return;
+        }
+        state.epoch += 1;
+        state.cancelled = true;
+        release(&mut state);
+        state.result = Some(Recorded::Away);
+        if let Some(ctx) = &state.repaint {
+            ctx.request_repaint();
+        }
     }
 
     impl Recorder {
@@ -381,9 +552,16 @@ mod platform {
             let epoch = {
                 let mut shared = self.shared.borrow_mut();
                 release(&mut shared);
-                *shared = Shared { epoch: shared.epoch + 1, repaint: Some(ctx.clone()), ..Shared::default() };
+                *shared = Shared {
+                    epoch: shared.epoch + 1,
+                    repaint: Some(ctx.clone()),
+                    sight: Sight::new(ctx.cumulative_pass_nr()),
+                    viewport: ctx.viewport_id(),
+                    ..Shared::default()
+                };
                 shared.epoch
             };
+            watch(&self.shared, epoch);
             let shared = self.shared.clone();
             spawn_local(async move {
                 let outcome = open(&shared, epoch).await;
@@ -400,6 +578,14 @@ mod platform {
             });
         }
 
+        pub fn drawn(&mut self, ctx: &egui::Context) {
+            if let Ok(mut shared) = self.shared.try_borrow_mut()
+                && ctx.viewport_id() == shared.viewport
+            {
+                shared.sight.drawn(ctx.cumulative_pass_nr());
+            }
+        }
+
         pub fn stop(&mut self) {
             let mut shared = self.shared.borrow_mut();
             shared.stopped_at = Some(js_sys::Date::now());
@@ -409,9 +595,11 @@ mod platform {
                         let _ = recorder.stop();
                     }
                 }
-                // Still asking for the microphone: the recording is given up, and the microphone closed when it opens.
+                // Still asking for the microphone: the recording is given up (its watch with it), and the microphone closed when
+                // it opens.
                 None => {
                     shared.epoch += 1;
+                    release(&mut shared);
                     shared.result = Some(Recorded::Nothing);
                 }
             }
@@ -482,8 +670,15 @@ mod platform {
             stop_tracks(&stream);
             return Ok(());
         }
-        // Granted while the page was out of sight (the person answered from elsewhere): nothing is recorded unseen.
-        if out_of_sight() {
+        // Granted while the page was out of sight (the person answered from elsewhere), or once the app drew the panel no more in
+        // the passes since the watch last looked (its pane closed while the browser asked): nothing is recorded unseen. A pane
+        // closed since that look is the watch's at its next one.
+        let unseen = {
+            let mut state = shared.borrow_mut();
+            let passes = passes(&state);
+            state.sight.look_asking(passes)
+        };
+        if out_of_sight() || unseen {
             stop_tracks(&stream);
             return Err(Recorded::Away);
         }
@@ -492,7 +687,11 @@ mod platform {
         if !mime.is_empty() {
             options.set_mime_type(mime);
         }
-        let recorder = MediaRecorder::new_with_media_stream_and_media_recorder_options(&stream, &options).map_err(|_| Recorded::Failed)?;
+        // A recorder the browser refuses leaves a stream nobody holds: its microphone is closed here.
+        let recorder = MediaRecorder::new_with_media_stream_and_media_recorder_options(&stream, &options).map_err(|_| {
+            stop_tracks(&stream);
+            Recorded::Failed
+        })?;
 
         // The level of the voice, for the bars and for telling a silence from a request.
         let (audio, analyser) = match AudioContext::new() {
@@ -574,37 +773,33 @@ mod platform {
         let on_hidden = {
             let shared = shared.clone();
             Closure::<dyn FnMut()>::new(move || {
-                if !out_of_sight() {
-                    return;
-                }
-                let mut state = shared.borrow_mut();
-                if state.epoch != epoch {
-                    return;
-                }
-                state.epoch += 1;
-                state.cancelled = true;
-                release(&mut state);
-                state.result = Some(Recorded::Away);
-                if let Some(ctx) = &state.repaint {
-                    ctx.request_repaint();
+                if out_of_sight() {
+                    let_go(&shared, epoch);
                 }
             })
+        };
+        // A page that is left takes nothing it heard with it, whatever the browser then does with the page.
+        let on_leave = {
+            let shared = shared.clone();
+            Closure::<dyn FnMut()>::new(move || let_go(&shared, epoch))
         };
         let watch: js_sys::Function = on_hidden.as_ref().unchecked_ref::<js_sys::Function>().clone();
         if let Some(page) = document() {
             let _ = page.add_event_listener_with_callback(VISIBILITY, &watch);
         }
-        let watch_timer = window.set_interval_with_callback_and_timeout_and_arguments_0(&watch, WATCH_MS).ok();
+        let leave: js_sys::Function = on_leave.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        let _ = window.add_event_listener_with_callback(LEAVE, &leave);
         recorder.set_ondataavailable(Some(on_data.as_ref().unchecked_ref()));
         recorder.set_onstop(Some(on_stop.as_ref().unchecked_ref()));
         {
             let mut state = shared.borrow_mut();
             state.keep.push(on_data);
             state.keep_stop.push(on_stop);
-            // Kept with the others: it may be running when the recording ends.
+            // Kept with the others: they may be running when the recording ends.
             state.keep_stop.push(on_hidden);
+            state.keep_stop.push(on_leave);
             state.watch = Some(watch);
-            state.watch_timer = watch_timer;
+            state.leave = Some(leave);
             state.mime = if mime.is_empty() { recorder.mime_type() } else { mime.to_string() };
             state.stream = Some(stream);
             state.audio = audio;
@@ -661,6 +856,67 @@ mod tests {
         assert!(voice.settled());
         assert_eq!(voice.take_notice(), Some(Recorded::Nothing));
         assert_eq!(voice.take_notice(), None, "said once");
+    }
+
+    /// A panel drawn in the frames between two looks keeps its microphone, however many frames there were.
+    #[test]
+    fn a_panel_drawn_between_two_looks_keeps_the_microphone() {
+        let mut sight = Sight::new(10);
+        for pass in 11..40 {
+            sight.drawn(pass);
+            if pass % 7 == 0 {
+                assert!(!sight.look(pass + 1), "drawn in pass {pass}");
+            }
+        }
+        assert!(!sight.look(40));
+    }
+
+    /// Frames ran since the last look and the panel was in none of them: its pane closed, or something else is shown in its place.
+    #[test]
+    fn a_panel_left_out_of_the_frames_lets_the_microphone_go() {
+        let mut sight = Sight::new(10);
+        sight.drawn(11);
+        assert!(!sight.look(12));
+        // The pane closed after pass 11: passes 12 and 13 ran without it.
+        assert!(sight.look(14));
+        // Closed right after the click: the pass of the click drew it, the next ones did not.
+        let mut sight = Sight::new(10);
+        assert!(!sight.look(11), "nothing ran after the click yet");
+        assert!(sight.look(13));
+    }
+
+    /// A look at which no frame ran says nothing of the panel (the app was busy, a frame is on its way); a few in a row mean the
+    /// app draws nothing at all, and shows nothing.
+    #[test]
+    fn an_app_that_draws_no_frame_at_all_lets_the_microphone_go() {
+        let mut sight = Sight::new(10);
+        for _ in 1..IDLE_LOOKS {
+            assert!(!sight.look(11));
+        }
+        assert!(sight.look(11));
+        // A frame between the looks starts the count again.
+        let mut sight = Sight::new(10);
+        for _ in 1..IDLE_LOOKS {
+            assert!(!sight.look(11));
+        }
+        sight.drawn(11);
+        assert!(!sight.look(12));
+        assert!(!sight.look(12));
+    }
+
+    /// While the browser asks for the microphone nothing is open: looks without a frame say nothing (a browser may stop drawing
+    /// behind its question) and don't add up to the microphone just granted; a panel left out of the frames that ran does.
+    #[test]
+    fn while_the_browser_asks_only_a_panel_left_out_lets_go() {
+        let mut sight = Sight::new(10);
+        for _ in 0..IDLE_LOOKS * 2 {
+            assert!(!sight.look_asking(11));
+        }
+        assert!(!sight.look(11), "the count of looks without a frame starts again once the microphone is open");
+        let mut sight = Sight::new(10);
+        sight.drawn(11);
+        assert!(!sight.look_asking(12), "drawn while the browser asks");
+        assert!(sight.look_asking(14), "the pane closed while the browser asks");
     }
 
     #[test]

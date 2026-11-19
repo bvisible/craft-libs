@@ -460,6 +460,12 @@ impl NoraPanel {
         let now = ui.input(|input| input.time);
         self.track(session, now);
         self.take_dictation(session);
+        // While the panel is drawn where it can be seen its microphone may stay open: an app that stops drawing it (its pane
+        // closed, something else shown in its place) or draws it hidden has it let go by the recorder's watch (voice.rs, `Sight`),
+        // whether it gives the dictation up or not.
+        if ui.is_visible() && ui.clip_rect().intersect(ui.max_rect()).is_positive() {
+            self.voice.drawn(ui.ctx());
+        }
         self.poll_voice(now, &mut actions);
         // The panel's own look, for the length of the panel: the app's visuals and style are as they were after.
         let kept_visuals = ui.visuals().clone();
@@ -2186,6 +2192,122 @@ mod tests {
         assert!(!h.state().actions.iter().any(|action| matches!(action, PanelAction::Dictate { .. } | PanelAction::Send(_))), "nothing leaves");
         assert_eq!(h.state().panel.draft(), "Bonjour", "what was typed stays");
         assert!(h.query_by_label("Dictate").is_some(), "the microphone is on offer again");
+    }
+
+    /// An app that stops drawing the panel while the person speaks (its pane closed by a way of its own, something else shown in
+    /// its place) and says nothing to it: the recorder's watch lets the microphone go at its next look, while a panel still
+    /// drawn keeps it however often the watch looks. Drawn again (the pane opened again), the panel shows no recording, and
+    /// nothing of it was sent.
+    #[test]
+    fn a_panel_its_app_no_longer_draws_lets_the_microphone_go() {
+        let mut h = Harness::builder().with_size(egui::vec2(360.0, 520.0)).build_ui_state(
+            |ui, state: &mut (State, bool)| {
+                if state.1 {
+                    let actions = state.0.panel.show(ui, &state.0.session);
+                    state.0.actions.extend(actions);
+                }
+            },
+            (State { panel: NoraPanel::new(), session: session(), actions: Vec::new() }, true),
+        );
+        h.state_mut().0.panel.voice.pretend_available();
+        h.run_steps(3);
+        h.get_by_label("Dictate").click();
+        h.run_steps(2);
+        h.state_mut().0.panel.voice.begin_for_test(0.0);
+        for _ in 0..5 {
+            h.run_steps(3);
+            let ctx = h.ctx.clone();
+            assert!(!h.state_mut().0.panel.voice.look_for_test(&ctx), "drawn: the microphone stays open");
+        }
+        assert!(h.state().0.panel.voice.listening());
+        // The app closes its pane without a word to the panel.
+        h.state_mut().1 = false;
+        h.run_steps(2);
+        let ctx = h.ctx.clone();
+        assert!(h.state_mut().0.panel.voice.look_for_test(&ctx), "no longer drawn: the microphone is let go");
+        // The pane opened again.
+        h.state_mut().1 = true;
+        h.run_steps(3);
+        assert!(h.state().0.panel.voice.settled(), "no recording runs");
+        assert!(h.query_by_label("Dictate").is_some(), "the microphone is on offer again");
+        assert!(!h.state().0.actions.iter().any(|action| matches!(action, PanelAction::Dictate { .. } | PanelAction::Send(_))), "nothing left");
+        assert!(h.state().0.panel.voice_notice.is_none(), "and nothing is said: the person had gone");
+    }
+
+    /// A panel the app draws hidden (in a `Ui` it made invisible) shows nothing of its microphone: the watch lets it go.
+    #[test]
+    fn a_panel_drawn_hidden_lets_the_microphone_go() {
+        let mut h = Harness::builder().with_size(egui::vec2(360.0, 520.0)).build_ui_state(
+            |ui, state: &mut (State, bool)| {
+                if !state.1 {
+                    ui.set_invisible();
+                }
+                let actions = state.0.panel.show(ui, &state.0.session);
+                state.0.actions.extend(actions);
+            },
+            (State { panel: NoraPanel::new(), session: session(), actions: Vec::new() }, true),
+        );
+        h.state_mut().0.panel.voice.pretend_available();
+        h.run_steps(3);
+        h.get_by_label("Dictate").click();
+        h.run_steps(2);
+        h.state_mut().0.panel.voice.begin_for_test(0.0);
+        h.run_steps(3);
+        let ctx = h.ctx.clone();
+        assert!(!h.state_mut().0.panel.voice.look_for_test(&ctx), "seen: the microphone stays open");
+        h.state_mut().1 = false;
+        h.run_steps(3);
+        let ctx = h.ctx.clone();
+        assert!(h.state_mut().0.panel.voice.look_for_test(&ctx), "drawn hidden: the microphone is let go");
+    }
+
+    /// Two panels of one app, each listening: each is watched for itself. The one the app stops drawing lets its microphone go,
+    /// the one still drawn beside it keeps its own.
+    #[test]
+    fn each_panel_is_watched_for_itself() {
+        struct Two {
+            kept: NoraPanel,
+            left: NoraPanel,
+            session: NoraSession,
+            draw_left: bool,
+            start: bool,
+        }
+        let mut h = Harness::builder().with_size(egui::vec2(760.0, 520.0)).build_ui_state(
+            |ui, two: &mut Two| {
+                // Each in a place of its own, as an app with two panes gives them (the panel's ids follow its `Ui`).
+                ui.columns(2, |columns| {
+                    columns[0].push_id("kept", |ui| two.kept.show(ui, &two.session));
+                    if two.draw_left {
+                        columns[1].push_id("left", |ui| two.left.show(ui, &two.session));
+                    }
+                });
+                // Both microphones asked for in a pass that drew both panels, as a click on each does.
+                if std::mem::take(&mut two.start) {
+                    two.kept.voice.start(ui.ctx());
+                    two.left.voice.start(ui.ctx());
+                }
+            },
+            Two { kept: NoraPanel::new(), left: NoraPanel::new(), session: session(), draw_left: true, start: false },
+        );
+        h.run_steps(2);
+        h.state_mut().start = true;
+        h.run_steps(1);
+        let two = h.state_mut();
+        for panel in [&mut two.kept, &mut two.left] {
+            panel.voice.pretend_available();
+            panel.voice.begin_for_test(0.0);
+        }
+        for _ in 0..3 {
+            h.run_steps(3);
+            let ctx = h.ctx.clone();
+            assert!(!h.state_mut().kept.voice.look_for_test(&ctx), "drawn: the first keeps its microphone");
+            assert!(!h.state_mut().left.voice.look_for_test(&ctx), "drawn: the second keeps its microphone");
+        }
+        h.state_mut().draw_left = false;
+        h.run_steps(3);
+        let ctx = h.ctx.clone();
+        assert!(h.state_mut().left.voice.look_for_test(&ctx), "the one no longer drawn lets its microphone go");
+        assert!(!h.state_mut().kept.voice.look_for_test(&ctx), "the one still drawn keeps its own");
     }
 
     /// Words that were on their way when the dictation was thrown away are written nowhere, even when they come in.

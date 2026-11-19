@@ -44,6 +44,12 @@ An app whose pane closes or shows something else gives up the dictation (`NoraPa
 its words are forgotten). The recorder lets the microphone go by itself when the page goes out of sight or its frame is hidden, a
 recording the browser ended is not sent, and a transcription that failed is said as such, not as silence. Only our two crates change.
 
+The same day, for an app that says nothing when its pane goes away: the recorder also lets the microphone go when the panel is no
+longer drawn, or drawn hidden, while the page is in sight (a watch between frames, on egui's count of passes, from the click on, the
+browser's question included), when the app draws no frame at all for two seconds, and when the page is left (`pagehide`). A
+recorder the browser refuses closes the microphone it was given, and a recording that ends hands no late event to a dropped
+callback. Only `crates/nora-ui` changes.
+
 ## 2026-11-12: `craft-proof` carries French, for builds that read no folder and download nothing
 
 Upstream's French is a Language pack that the app downloads; a build that runs in a browser can neither read a folder nor download. The fork
